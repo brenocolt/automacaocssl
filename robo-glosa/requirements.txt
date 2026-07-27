@@ -1,5 +1,4 @@
 fastapi>=0.110
 uvicorn[standard]>=0.29
 pydantic>=2.6
-# Fixo e igual a tag da imagem Docker (mcr.microsoft.com/playwright/python:v1.62.0-noble)
-playwright==1.62.0
+playwright==1.61.0
