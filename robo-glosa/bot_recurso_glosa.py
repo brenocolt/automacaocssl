@@ -320,9 +320,62 @@ def pesquisar_lote(rge: Page, lote: str, data_inicio: str, data_fim: str):
         aguardar_ajax(rge)
         aguardar_pagina_pronta(rge)
         esperar_tabela_guias(rge)
+
+        # Se voltou vazio, tenta de novo uma vez (pode ser ajax perdido) e,
+        # se insistir, informa o estado real dos filtros em vez de so falhar.
+        if contar_linhas_guias(rge) == 0:
+            log.warning("Busca do lote %s voltou vazia; tentando novamente", lote)
+            rge.wait_for_timeout(1500)
+            rge.get_by_role("button", name=re.compile("^Pesquisar$", re.I)).click()
+            aguardar_ajax(rge)
+            aguardar_pagina_pronta(rge)
+            esperar_tabela_guias(rge)
+
+        if contar_linhas_guias(rge) == 0:
+            estado = ler_estado_filtros(rge)
+            caminho = capturar_screenshot_erro(rge, "busca_vazia")
+            raise RuntimeError(
+                f"Busca do lote {lote} nao retornou linhas. "
+                f"Filtros como o portal recebeu: {estado}. Print: {caminho}"
+            )
     except Exception as e:
         caminho = capturar_screenshot_erro(rge, "pesquisa")
         raise RuntimeError(f"Falha na pesquisa do lote {lote} ({e}). Print: {caminho}")
+
+
+def ler_estado_filtros(rge: Page) -> Dict:
+    """Le de volta o que REALMENTE ficou nos filtros. Serve para diagnosticar
+    buscas que voltam vazias: mostra se o valor digitado foi aceito pelo
+    PrimeFaces ou se algo reverteu para o padrao."""
+    estado = {}
+    try:
+        estado["lote"] = rge.locator(ID_LOTE).input_value(timeout=3000)
+    except Exception:
+        estado["lote"] = "<nao lido>"
+    for rotulo, base in (("data_inicio", ID_DATA_INI), ("data_fim", ID_DATA_FIM)):
+        try:
+            campo, _ = _localizar_input_data(rge, base)
+            estado[rotulo] = campo.input_value(timeout=3000) if campo else "<nao encontrado>"
+        except Exception:
+            estado[rotulo] = "<nao lido>"
+    try:
+        chk = rge.get_by_role("checkbox", name=re.compile("Exibir somente as guias", re.I))
+        estado["checkbox_somente_disponiveis"] = chk.is_checked(timeout=3000)
+    except Exception:
+        estado["checkbox_somente_disponiveis"] = "<nao lido>"
+    try:
+        vazio = rge.locator(f'[id="{ID_TABELA_GUIAS}_data"] tr.ui-datatable-empty-message')
+        estado["mensagem_tabela"] = vazio.first.inner_text(timeout=2000) if vazio.count() else ""
+    except Exception:
+        estado["mensagem_tabela"] = "<nao lido>"
+    return estado
+
+
+def contar_linhas_guias(rge: Page) -> int:
+    try:
+        return rge.locator(f'[id="{ID_TABELA_GUIAS}_data"] tr[data-ri]').count()
+    except Exception:
+        return 0
 
 
 def esperar_tabela_guias(rge: Page, timeout: int = 30000):
