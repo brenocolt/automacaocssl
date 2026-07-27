@@ -1,0 +1,24 @@
+services:
+  robo-glosa:
+    build: .
+    restart: unless-stopped
+    # ipc: host evita que o Chromium fique sem memoria compartilhada e
+    # trave em lotes maiores.
+    ipc: host
+    environment:
+      - SULAMERICA_PORTAL_URL=${SULAMERICA_PORTAL_URL}
+      - SULAMERICA_RGE_URL=${SULAMERICA_RGE_URL}
+      - SULAMERICA_CODIGO=${SULAMERICA_CODIGO}
+      - SULAMERICA_USER=${SULAMERICA_USER}
+      - SULAMERICA_PASS=${SULAMERICA_PASS}
+      - HEADLESS=true
+      - DELAY_ENTRE_ACOES_MS=400
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+# ATENCAO: nao ha secao "ports" de proposito. Sem ela, o robo fica acessivel
+# apenas de dentro da rede Docker (ou seja, para o n8n) e nunca pela internet.
+# Nao configure dominio para este recurso no Coolify.
