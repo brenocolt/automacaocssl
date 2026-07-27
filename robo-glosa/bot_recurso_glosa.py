@@ -251,12 +251,34 @@ def ir_para_aba(rge: Page, aba: str):
     """As duas abas (Mat/Med e Itens) usam exatamente os mesmos IDs de campo e
     de tabela - confirmado inspecionando o HTML das duas. So muda o caminho de
     entrada e o estado inicial do checkbox."""
+    # Ao terminar uma aba, o modal "Detalhes da Guia" costuma ficar aberto e
+    # o overlay dele bloqueia o clique no menu da outra aba.
+    fechar_modal(rge)
+
     menu = MENU_POR_ABA[aba]
-    try:
-        rge.locator(f'[id="{menu}"]').click(timeout=10000)
-    except Exception:
-        rotulo = "Recursar Mat/Med" if aba == "matmed" else "Recursar Itens"
-        rge.get_by_role("link", name=rotulo).click(timeout=10000)
+    rotulo = "Recursar Mat/Med" if aba == "matmed" else "Recursar Itens"
+    tentativas = [
+        ("menu do topo", lambda: rge.locator(f'[id="{menu}"]').click(timeout=10000)),
+        ("link da tela inicial", lambda: rge.get_by_role("link", name=rotulo).click(timeout=8000)),
+        ("menu via JavaScript", lambda: rge.evaluate(
+            "(id) => { const el = document.getElementById(id); if (!el) throw new Error('menu nao encontrado'); el.click(); }",
+            menu)),
+    ]
+
+    erros = []
+    for descricao, acao in tentativas:
+        try:
+            acao()
+            log.info("Entrei na aba %s pelo %s", aba, descricao)
+            break
+        except Exception as e:
+            erros.append(f"{descricao}: {type(e).__name__}")
+            continue
+    else:
+        caminho = capturar_screenshot_erro(rge, f"aba_{aba}")
+        raise RuntimeError(
+            f"Nao consegui abrir a aba {aba}. Tentativas: {'; '.join(erros)}. Print: {caminho}"
+        )
 
     try:  # modal de aviso com botao OK
         rge.get_by_role("button", name=re.compile("^OK$", re.I)).click(timeout=6000)
