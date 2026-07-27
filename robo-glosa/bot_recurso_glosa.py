@@ -53,7 +53,10 @@ MENU_POR_ABA = {"matmed": "formLink:menuMatMed", "itens": "formLink:menuItens"}
 ABAS = ("matmed", "itens")
 ID_TABELA_RECURSOS = "formGrid:formRecursos:gridTableRecursos"
 ID_TABELA_ITENS = "formRecursar:itensRecursoTable"
-ID_DATA_REALIZACAO = "visualizarDadosGuia:dataRealizacao"
+IDS_DATA_REALIZACAO = (
+    "visualizarDadosGuia:dataRealizacao",     # aba Mat/Med
+    "dadosGuiaContaGlosada:dataRealizacao",   # aba Itens
+)
 
 app = FastAPI(title="Bot Recurso de Glosa - SulAmérica")
 
@@ -331,8 +334,18 @@ def garantir_tela_de_pesquisa(rge: Page, aba: str = "matmed"):
         except Exception:
             continue
 
+    # Ultimo recurso: reentrar pela aba do zero
+    try:
+        ir_para_aba(rge, aba)
+        if rge.locator(ID_LOTE).count() > 0:
+            return
+    except Exception:
+        pass
+
     caminho = capturar_screenshot_erro(rge, "voltar_pesquisa")
-    raise RuntimeError(f"Nao consegui voltar para a tela de pesquisa. Print: {caminho}")
+    raise RuntimeError(
+        f"Nao consegui voltar para a tela de pesquisa da aba {aba}. Print: {caminho}"
+    )
 
 
 def preencher_lote(rge: Page, lote: str):
@@ -602,69 +615,166 @@ def abrir_visualizar_protocolo(rge: Page, row_index: int) -> Dict:
     aguardar_pagina_pronta(rge)
 
     data_uso = ""
-    try:
-        data_uso = rge.locator(f'[id="{ID_DATA_REALIZACAO}"]').inner_text(timeout=10000).strip()
-    except Exception:
+    for id_data in IDS_DATA_REALIZACAO:
+        try:
+            alvo = rge.locator(f'[id="{id_data}"]')
+            if alvo.count():
+                data_uso = alvo.first.inner_text(timeout=5000).strip()
+                if data_uso:
+                    break
+        except Exception:
+            continue
+    if not data_uso:
         log.warning("Nao consegui ler 'Data da realizacao'")
 
     itens = []
     try:
-        rge.locator(f'[id="{ID_TABELA_ITENS}"]').wait_for(timeout=20000)
-        linhas = rge.locator(f'[id="{ID_TABELA_ITENS}_data"] tr[data-ri]')
-        for i in range(linhas.count()):
-            celulas = linhas.nth(i).locator("td")
-            textos = [celulas.nth(c).inner_text().strip() for c in range(celulas.count())]
-            itens.append(_extrair_item(textos))
+        try:
+            rge.locator(f'[id="{ID_TABELA_ITENS}"]').wait_for(timeout=8000)
+        except Exception:
+            rge.wait_for_timeout(1500)   # aba Itens usa outro ID
+
+        brutos = rge.evaluate(
+            """(idTabela) => {
+                let tbody = document.getElementById(idTabela + '_data');
+                if (!tbody) {
+                    // aba diferente pode usar outro id: procura pela coluna
+                    for (const d of document.querySelectorAll('div.ui-datatable')) {
+                        if (/C.d\\.?\\s*Servi/i.test(d.innerText || '')) {
+                            tbody = d.querySelector('tbody[id$="_data"]');
+                            if (tbody) break;
+                        }
+                    }
+                }
+                if (!tbody) return null;
+
+                const linhas = Array.from(tbody.querySelectorAll('tr'));
+                const saida = [];
+                for (let i = 0; i < linhas.length; i++) {
+                    const tr = linhas[i];
+                    if (!tr.hasAttribute('data-ri')) continue;
+                    const celulas = Array.from(tr.querySelectorAll('td'))
+                        .map(td => (td.innerText || '').trim());
+
+                    // A justificativa pode estar numa celula desta linha (Mat/Med)
+                    // ou numa linha irma escondida logo abaixo (Itens).
+                    let justificativa = '';
+                    const prox = linhas[i + 1];
+                    if (prox && !prox.hasAttribute('data-ri') &&
+                        /justificativa/i.test(prox.innerText || '')) {
+                        justificativa = prox.innerText || '';
+                    }
+                    saida.push({ celulas, justificativa });
+                }
+                return saida;
+            }""",
+            ID_TABELA_ITENS,
+        )
+
+        if brutos is None:
+            caminho = capturar_screenshot_erro(rge, "sem_tabela_itens")
+            raise RuntimeError(f"Tabela de itens nao encontrada. Print: {caminho}")
+
+        for bruto in brutos:
+            itens.append(_extrair_item(bruto["celulas"], bruto.get("justificativa", "")))
     except Exception as e:
         log.warning("Nao consegui ler a tabela de itens: %s", e)
 
     return {"data_uso": data_uso, "itens": itens}
 
 
+def _localizar_tabela_itens(rge: Page):
+    """A tabela de itens tem ID diferente em cada aba. Em vez de fixar o do
+    Mat/Med, tenta o conhecido e, se nao achar, procura qualquer DataTable que
+    tenha a coluna 'Cod. Servico'."""
+    alvo = rge.locator(f'[id="{ID_TABELA_ITENS}_data"]')
+    if alvo.count():
+        return alvo.first
+
+    for texto in ("Cód. Serviço", "Cod. Servico", "Cód. Glosa"):
+        candidatos = rge.locator(
+            f'div.ui-datatable:has-text("{texto}") tbody[id$="_data"]'
+        )
+        if candidatos.count():
+            tid = candidatos.first.get_attribute("id")
+            log.info("Tabela de itens encontrada por conteudo: %s", tid)
+            return candidatos.first
+
+    return None
+
+
 def _limpar_justificativa(texto: str) -> str:
-    """A celula vem como 'Justificativa\n\t\t...\n\tItem recursado - ...'.
-    Queremos so o texto final."""
+    """O texto vem com o rotulo junto: em varias linhas no Mat/Med
+    ('Justificativa\\n...\\nItem recursado - ...') e numa linha so na aba
+    Itens ('Justificativa Solicito reanalise...')."""
+    if not texto:
+        return ""
     linhas = [l.strip() for l in texto.splitlines() if l.strip()]
     linhas = [l for l in linhas if l.lower() != "justificativa"]
-    return linhas[-1] if linhas else ""
+    resultado = linhas[-1] if linhas else ""
+    return re.sub(r"^justificativa[:\s]*", "", resultado, flags=re.I).strip()
 
 
-def _extrair_item(textos: List[str]) -> Dict:
-    """A tabela usa colunas congeladas, entao a primeira celula repete a linha
-    inteira. Em vez de indices fixos, localizamos a celula do 'Cod. Servico'
-    (a unica com ' - ') e lemos as seguintes por deslocamento:
-        Cod. Servico | Cod. Glosa | Valor Glosado | Qtde
-    A justificativa e a celula que contem a palavra 'Justificativa'."""
-    idx_servico = None
-    for i, t in enumerate(textos):
-        if " - " in t and "\n" not in t:
-            idx_servico = i
-            break
+def _extrair_item(textos: List[str], justificativa_externa: str = "") -> Dict:
+    """Identifica cada campo pelo CONTEUDO, nao pela posicao. As duas abas tem
+    layouts diferentes - a de Itens traz uma coluna vazia a mais entre
+    "Cod. Servico" e "Cod. Glosa" - e ler por deslocamento fixo pegava a
+    coluna errada em todos os campos.
 
-    def pos(offset: int) -> str:
-        if idx_servico is None:
-            return ""
-        j = idx_servico + offset
-        return textos[j] if 0 <= j < len(textos) else ""
+    Mat/Med: [.., '22', '0000273772 - TIRA...', '1705', 'R$ 3,95', '1', ..]
+    Itens  : ['', '15', '60023120 - TAXA...', '', '1714', 'R$ 22,10', '1', '']
+    """
+    def so_digitos(t: str) -> bool:
+        return bool(t) and t.replace(".", "").isdigit()
 
-    cod_servico = pos(0)
+    # 1) a celula do servico e a unica com " - " e sem quebra de linha
+    idx_servico = next(
+        (i for i, t in enumerate(textos) if " - " in t and "\n" not in t), None
+    )
+    if idx_servico is None:
+        return {
+            "seq": "", "codigo": "", "descricao": "", "cod_glosa": "",
+            "valor_glosado": "", "qtde": 0,
+            "justificativa": _limpar_justificativa(justificativa_externa),
+            "_colunas_cruas": textos,
+        }
+
+    cod_servico = textos[idx_servico]
     codigo, _, descricao = cod_servico.partition(" - ")
-    qtde_txt = pos(3)
 
-    justificativa = ""
-    for t in textos:
-        if "justificativa" in t.lower():
-            justificativa = _limpar_justificativa(t)
-            break
+    depois = textos[idx_servico + 1:]
+
+    # 2) o valor glosado e a celula com "R$"
+    idx_valor = next((i for i, t in enumerate(depois) if "R$" in t), None)
+    valor_glosado = depois[idx_valor] if idx_valor is not None else ""
+
+    # 3) cod. glosa: celula numerica ANTES do valor
+    faixa_glosa = depois[:idx_valor] if idx_valor is not None else depois
+    cod_glosa = next((t for t in faixa_glosa if so_digitos(t)), "")
+
+    # 4) qtde: primeira celula numerica DEPOIS do valor
+    faixa_qtde = depois[idx_valor + 1:] if idx_valor is not None else []
+    qtde_txt = next((t for t in faixa_qtde if so_digitos(t)), "")
+
+    # 5) seq: ultima celula numerica ANTES do servico
+    seq = ""
+    for t in textos[:idx_servico]:
+        if so_digitos(t):
+            seq = t
+
+    # 6) justificativa: linha irma escondida (Itens) ou celula da propria linha (Mat/Med)
+    justificativa = justificativa_externa
+    if not justificativa:
+        justificativa = next((t for t in textos if "justificativa" in t.lower()), "")
 
     return {
-        "seq": pos(-1),
+        "seq": seq,
         "codigo": codigo.strip().lstrip("0") or "0",
         "descricao": descricao.strip(),
-        "cod_glosa": pos(1),
-        "valor_glosado": pos(2),
+        "cod_glosa": cod_glosa,
+        "valor_glosado": valor_glosado,
         "qtde": int(qtde_txt) if qtde_txt.isdigit() else 0,
-        "justificativa": justificativa,
+        "justificativa": _limpar_justificativa(justificativa),
         "_colunas_cruas": textos,
     }
 
