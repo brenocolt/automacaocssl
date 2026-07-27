@@ -335,6 +335,67 @@ def garantir_tela_de_pesquisa(rge: Page, aba: str = "matmed"):
     raise RuntimeError(f"Nao consegui voltar para a tela de pesquisa. Print: {caminho}")
 
 
+def preencher_lote(rge: Page, lote: str):
+    """Limpa e preenche o campo Lote, CONFERINDO o valor depois. Sem limpar
+    antes, o valor novo pode grudar em restos do anterior (ex: pedir
+    6300000641 e o portal receber 630000064163), e a busca volta vazia sem
+    deixar claro o motivo."""
+    campo = rge.locator(ID_LOTE)
+    campo.wait_for(timeout=15000)
+
+    def conferir() -> bool:
+        try:
+            return campo.input_value(timeout=3000).strip() == lote
+        except Exception:
+            return False
+
+    # 1) limpar e preencher
+    try:
+        campo.fill("", timeout=5000)
+        rge.wait_for_timeout(150)
+        campo.fill(lote, timeout=5000)
+        if conferir():
+            return
+    except Exception:
+        pass
+
+    # 2) selecionar tudo e digitar por cima
+    try:
+        campo.click(timeout=5000)
+        rge.keyboard.press("ControlOrMeta+A")
+        rge.keyboard.press("Delete")
+        rge.keyboard.type(lote, delay=40)
+        if conferir():
+            return
+    except Exception:
+        pass
+
+    # 3) via JavaScript, disparando os eventos que o JSF escuta
+    try:
+        rge.evaluate(
+            """([sel, val]) => {
+                const el = document.querySelector(sel);
+                if (!el) return;
+                el.value = '';
+                el.value = val;
+                el.dispatchEvent(new Event('input', { bubbles: true }));
+                el.dispatchEvent(new Event('change', { bubbles: true }));
+            }""",
+            [ID_LOTE, lote],
+        )
+        if conferir():
+            return
+    except Exception:
+        pass
+
+    atual = ""
+    try:
+        atual = campo.input_value()
+    except Exception:
+        pass
+    raise RuntimeError(f"Campo Lote ficou com '{atual}' em vez de '{lote}'")
+
+
 def desmarcar_somente_disponiveis(rge: Page):
     """Com esse filtro ligado, guias ja recursadas somem do resultado - e e
     justamente o historico que queremos. No Mat/Med vem desmarcado; na aba
@@ -352,7 +413,7 @@ def pesquisar_lote(rge: Page, lote: str, data_inicio: str, data_fim: str,
                    aba: str = "matmed"):
     try:
         garantir_tela_de_pesquisa(rge, aba)
-        rge.locator(ID_LOTE).fill(lote, timeout=8000)
+        preencher_lote(rge, lote)
 
         # CRÍTICO: com esse checkbox marcado, guias já recursadas NÃO aparecem.
         # Como buscamos o histórico de recursos já enviados, ele precisa ficar
