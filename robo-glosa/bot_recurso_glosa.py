@@ -46,6 +46,11 @@ ID_LOTE = '[id="formFiltros:loteConta:loteConta"]'
 ID_DATA_INI = "formFiltros:dataPagamentoConta"
 ID_DATA_FIM = "formFiltros:dataPagamentoContaFim"
 ID_TABELA_GUIAS = "formGrid:formGrid:gridTable"
+ID_CHECKBOX_DISPONIVEIS = "formFiltros:somenteGuiasDisponiveis"
+ID_BTN_PESQUISAR = "formFiltros:btnPesquisar"
+ID_BTN_DETALHES = "formGrid:formButtons:modalDialogButton"
+MENU_POR_ABA = {"matmed": "formLink:menuMatMed", "itens": "formLink:menuItens"}
+ABAS = ("matmed", "itens")
 ID_TABELA_RECURSOS = "formGrid:formRecursos:gridTableRecursos"
 ID_TABELA_ITENS = "formRecursar:itensRecursoTable"
 ID_DATA_REALIZACAO = "visualizarDadosGuia:dataRealizacao"
@@ -60,12 +65,14 @@ class ProcessarLoteRequest(BaseModel):
 
 
 class ItemExtraido(BaseModel):
+    aba: str = ""
     guia: str = ""
     protocolo: str = ""
     data_recurso: Optional[str] = None
     data_complemento: Optional[str] = None
     valor_unit: Optional[str] = None
     valor_total: Optional[str] = None
+    valor_acatado: Optional[str] = None
     qtd_itens_protocolo: Optional[str] = None
     data_uso: Optional[str] = None
     descricao_item: Optional[str] = None
@@ -240,16 +247,28 @@ def abrir_rge(page: Page) -> Page:
     return rge
 
 
-def ir_para_matmed(rge: Page):
-    # Sem regex aqui: a barra em "Mat/Med" quebra o parser de seletores do
-    # Playwright (ele usa / para delimitar a própria expressão regular).
-    rge.get_by_role("link", name="Recursar Mat/Med").click()
-    # Aparece um modal de aviso com botão OK
+def ir_para_aba(rge: Page, aba: str):
+    """As duas abas (Mat/Med e Itens) usam exatamente os mesmos IDs de campo e
+    de tabela - confirmado inspecionando o HTML das duas. So muda o caminho de
+    entrada e o estado inicial do checkbox."""
+    menu = MENU_POR_ABA[aba]
     try:
+        rge.locator(f'[id="{menu}"]').click(timeout=10000)
+    except Exception:
+        rotulo = "Recursar Mat/Med" if aba == "matmed" else "Recursar Itens"
+        rge.get_by_role("link", name=rotulo).click(timeout=10000)
+
+    try:  # modal de aviso com botao OK
         rge.get_by_role("button", name=re.compile("^OK$", re.I)).click(timeout=6000)
     except Exception:
         pass
+    aguardar_ajax(rge)
     aguardar_pagina_pronta(rge)
+
+
+# Mantido para o inspecionar.py continuar funcionando
+def ir_para_matmed(rge: Page):
+    ir_para_aba(rge, "matmed")
 
 
 def fechar_modal(rge: Page):
@@ -268,14 +287,14 @@ def fechar_modal(rge: Page):
             pass
 
 
-def garantir_tela_de_pesquisa(rge: Page):
+def garantir_tela_de_pesquisa(rge: Page, aba: str = "matmed"):
     """Abrir um protocolo tira o robo da tela de pesquisa (e um submit JSF).
     Antes de cada nova busca, garante que estamos de volta nela."""
     fechar_modal(rge)
     if rge.locator(ID_LOTE).count() > 0:
         return
 
-    for seletor in ['[id="formLink:menuMatMed"]', "#menu2"]:
+    for seletor in [f'[id="{MENU_POR_ABA[aba]}"]', "#menu2"]:
         try:
             rge.locator(seletor).first.click(timeout=8000)
             aguardar_ajax(rge)
@@ -294,29 +313,37 @@ def garantir_tela_de_pesquisa(rge: Page):
     raise RuntimeError(f"Nao consegui voltar para a tela de pesquisa. Print: {caminho}")
 
 
-def pesquisar_lote(rge: Page, lote: str, data_inicio: str, data_fim: str):
+def desmarcar_somente_disponiveis(rge: Page):
+    """Com esse filtro ligado, guias ja recursadas somem do resultado - e e
+    justamente o historico que queremos. No Mat/Med vem desmarcado; na aba
+    Itens vem MARCADO por padrao."""
     try:
-        garantir_tela_de_pesquisa(rge)
+        campo = rge.locator(f'[id="{ID_CHECKBOX_DISPONIVEIS}"]')
+        if campo.count() and campo.is_checked():
+            campo.uncheck(timeout=6000)
+            pausa_humana(rge)
+    except Exception as e:
+        log.warning("Nao consegui desmarcar 'somente guias disponiveis': %s", e)
+
+
+def pesquisar_lote(rge: Page, lote: str, data_inicio: str, data_fim: str,
+                   aba: str = "matmed"):
+    try:
+        garantir_tela_de_pesquisa(rge, aba)
         rge.locator(ID_LOTE).fill(lote, timeout=8000)
 
         # CRÍTICO: com esse checkbox marcado, guias já recursadas NÃO aparecem.
         # Como buscamos o histórico de recursos já enviados, ele precisa ficar
         # desmarcado. Fazemos isso ANTES das datas porque esse clique dispara
         # um recarregamento parcial do PrimeFaces que pode resetar os campos.
-        try:
-            chk = rge.get_by_role("checkbox", name=re.compile("Exibir somente as guias", re.I))
-            if chk.is_checked():
-                chk.uncheck()
-                pausa_humana(rge)
-        except Exception:
-            log.warning("Não consegui verificar o checkbox 'Exibir somente as guias'")
+        desmarcar_somente_disponiveis(rge)
 
         preencher_data_primefaces(rge, ID_DATA_INI, data_inicio)
         preencher_data_primefaces(rge, ID_DATA_FIM, data_fim)
         log.info("Filtros preenchidos: lote=%s, %s a %s", lote, data_inicio, data_fim)
 
         pausa_humana(rge)
-        rge.get_by_role("button", name=re.compile("^Pesquisar$", re.I)).click()
+        rge.locator(f'[id="{ID_BTN_PESQUISAR}"]').click()
         aguardar_ajax(rge)
         aguardar_pagina_pronta(rge)
         esperar_tabela_guias(rge)
@@ -326,7 +353,7 @@ def pesquisar_lote(rge: Page, lote: str, data_inicio: str, data_fim: str):
         if contar_linhas_guias(rge) == 0:
             log.warning("Busca do lote %s voltou vazia; tentando novamente", lote)
             rge.wait_for_timeout(1500)
-            rge.get_by_role("button", name=re.compile("^Pesquisar$", re.I)).click()
+            rge.locator(f'[id="{ID_BTN_PESQUISAR}"]').click()
             aguardar_ajax(rge)
             aguardar_pagina_pronta(rge)
             esperar_tabela_guias(rge)
@@ -335,7 +362,7 @@ def pesquisar_lote(rge: Page, lote: str, data_inicio: str, data_fim: str):
             estado = ler_estado_filtros(rge)
             caminho = capturar_screenshot_erro(rge, "busca_vazia")
             raise RuntimeError(
-                f"Busca do lote {lote} nao retornou linhas. "
+                f"Busca do lote {lote} na aba {aba} nao retornou linhas. "
                 f"Filtros como o portal recebeu: {estado}. Print: {caminho}"
             )
     except Exception as e:
@@ -427,7 +454,7 @@ def abrir_detalhes_guia(rge: Page, row_index: int):
     linha.wait_for(timeout=30000)
     linha.click()
     pausa_humana(rge)
-    rge.get_by_role("button", name=re.compile("Detalhes da Guia", re.I)).click()
+    rge.locator(f'[id="{ID_BTN_DETALHES}"]').click()
     aguardar_ajax(rge)
     rge.locator(f'[id="{ID_TABELA_RECURSOS}_data"]').wait_for(timeout=20000)
     pausa_humana(rge)
@@ -458,6 +485,7 @@ def listar_protocolos(rge: Page) -> List[Dict]:
         recursado = celulas.nth(5).inner_text().strip()   # -> "Valor total"
         qtd_itens = celulas.nth(6).inner_text().strip()
         inf = celulas.nth(7).inner_text().strip()         # -> "Valor Unit"
+        acatado = celulas.nth(9).inner_text().strip()     # -> "Vl Recuperado"
 
         # So a linha de ENVIO abre a tela com a tabela de itens
         eh_envio = linha.locator(f'[id$=":{i}:linkVisualizarRecurso"]').count() > 0
@@ -478,6 +506,8 @@ def listar_protocolos(rge: Page) -> List[Dict]:
             entry["valor_total"] = recursado
         if qtd_itens and not entry.get("qtd_itens_protocolo"):
             entry["qtd_itens_protocolo"] = qtd_itens
+        if acatado and not entry.get("valor_acatado"):
+            entry["valor_acatado"] = acatado
 
     return [protocolos[p] for p in ordem]
 
@@ -579,9 +609,10 @@ def consolidar_itens(itens: List[Dict]) -> Dict:
     }
     if len(justificativas) > 1:
         resultado["revisao_manual"] = True
+        lista = " | ".join(sorted(justificativas))
         resultado["erro"] = (
             f"Protocolo com {len(justificativas)} justificativas diferentes "
-            f"entre os itens - conferir manualmente"
+            f"entre os {len(itens)} itens: {lista}"
         )
     return resultado
 
@@ -590,9 +621,12 @@ def consolidar_itens(itens: List[Dict]) -> Dict:
 
 @app.post("/processar-lote", response_model=List[ItemExtraido])
 def processar_lote(req: ProcessarLoteRequest):
-    """IMPORTANTE: abrir um protocolo e um submit de formulario JSF, que sai
-    da tela de resultados e descarta a busca. Por isso refazemos a pesquisa
-    antes de cada protocolo, em vez de tentar 'voltar' na navegacao."""
+    """Percorre AS DUAS abas (Mat/Med e Itens). Confirmado com o cliente: a
+    planilha reune protocolos das duas, e buscar so em Mat/Med deixava cerca
+    de dois tercos dos protocolos de fora.
+
+    Abrir um protocolo e um submit JSF que descarta a busca; por isso a
+    pesquisa e refeita antes de cada protocolo."""
     resultados: List[ItemExtraido] = []
 
     with sync_playwright() as p:
@@ -602,74 +636,330 @@ def processar_lote(req: ProcessarLoteRequest):
             try:
                 fazer_login(page)
                 rge = abrir_rge(page)
-                ir_para_matmed(rge)
             except Exception as e:
                 raise HTTPException(status_code=502, detail=str(e))
 
-            def preparar(guia_index: Optional[int] = None):
-                """Refaz a busca; opcionalmente ja abre o modal de uma guia."""
-                pesquisar_lote(rge, req.lote, req.data_inicio_pagto, req.data_fim_pagto)
-                if guia_index is not None:
-                    abrir_detalhes_guia(rge, guia_index)
-
-            preparar()
-            guias = listar_guias(rge)
-            log.info("Lote %s: %d guia(s)", req.lote, len(guias))
-            if not guias:
-                return resultados
-
-            for guia in guias:
-                rotulo = f"{guia['guia']} - {guia['paciente']}"
+            for aba in ABAS:
                 try:
-                    preparar(guia["row_index"])
-                    protocolos = listar_protocolos(rge)
-                    log.info("Guia %s: %d protocolo(s)", guia["guia"], len(protocolos))
-
-                    for prot in protocolos:
-                        if prot.get("row_index") is None:
-                            resultados.append(ItemExtraido(
-                                guia=guia["guia"], protocolo=prot["protocolo"],
-                                data_recurso=prot.get("data_recurso"),
-                                data_complemento=prot.get("data_complemento"),
-                                valor_unit=prot.get("valor_unit"),
-                                valor_total=prot.get("valor_total"),
-                                revisao_manual=True,
-                                erro="Protocolo sem linha de envio (so retorno)",
-                            ))
-                            continue
-                        try:
-                            preparar(guia["row_index"])
-                            detalhe = abrir_visualizar_protocolo(rge, prot["row_index"])
-                            consolidado = consolidar_itens(detalhe["itens"])
-                            resultados.append(ItemExtraido(
-                                guia=guia["guia"],
-                                protocolo=prot["protocolo"],
-                                data_recurso=prot.get("data_recurso"),
-                                data_complemento=prot.get("data_complemento"),
-                                valor_unit=prot.get("valor_unit"),
-                                valor_total=prot.get("valor_total"),
-                                qtd_itens_protocolo=prot.get("qtd_itens_protocolo"),
-                                data_uso=detalhe["data_uso"],
-                                **consolidado,
-                            ))
-                        except Exception as e:
-                            log.exception("Falha no protocolo %s", prot.get("protocolo"))
-                            capturar_screenshot_erro(rge, f"protocolo_{prot.get('protocolo')}")
-                            resultados.append(ItemExtraido(
-                                guia=guia["guia"], protocolo=prot.get("protocolo", ""),
-                                erro=str(e), revisao_manual=True,
-                            ))
+                    ir_para_aba(rge, aba)
                 except Exception as e:
-                    log.exception("Falha na guia %s", rotulo)
+                    log.exception("Falha ao entrar na aba %s", aba)
                     resultados.append(ItemExtraido(
-                        guia=guia.get("guia", ""), erro=str(e), revisao_manual=True,
+                        aba=aba, erro=f"Nao consegui abrir a aba {aba}: {e}",
+                        revisao_manual=True,
                     ))
+                    continue
+
+                def preparar(guia_index: Optional[int] = None, _aba=aba):
+                    pesquisar_lote(rge, req.lote, req.data_inicio_pagto,
+                                   req.data_fim_pagto, _aba)
+                    if guia_index is not None:
+                        abrir_detalhes_guia(rge, guia_index)
+
+                try:
+                    preparar()
+                    guias = listar_guias(rge)
+                except Exception as e:
+                    # Lote sem nada nesta aba e situacao normal, nao erro.
+                    log.info("Aba %s, lote %s: sem resultados (%s)", aba, req.lote, e)
+                    continue
+
+                log.info("Aba %s, lote %s: %d guia(s)", aba, req.lote, len(guias))
+
+                for guia in guias:
+                    try:
+                        preparar(guia["row_index"])
+                        protocolos = listar_protocolos(rge)
+                        log.info("  guia %s: %d protocolo(s)", guia["guia"], len(protocolos))
+
+                        for prot in protocolos:
+                            if prot.get("row_index") is None:
+                                resultados.append(ItemExtraido(
+                                    aba=aba, guia=guia["guia"], protocolo=prot["protocolo"],
+                                    data_recurso=prot.get("data_recurso"),
+                                    data_complemento=prot.get("data_complemento"),
+                                    valor_unit=prot.get("valor_unit"),
+                                    valor_total=prot.get("valor_total"),
+                                    revisao_manual=True,
+                                    erro="Protocolo sem linha de envio (so retorno)",
+                                ))
+                                continue
+                            try:
+                                preparar(guia["row_index"])
+                                detalhe = abrir_visualizar_protocolo(rge, prot["row_index"])
+                                consolidado = consolidar_itens(detalhe["itens"])
+                                resultados.append(ItemExtraido(
+                                    aba=aba,
+                                    guia=guia["guia"],
+                                    protocolo=prot["protocolo"],
+                                    data_recurso=prot.get("data_recurso"),
+                                    data_complemento=prot.get("data_complemento"),
+                                    valor_unit=prot.get("valor_unit"),
+                                    valor_total=prot.get("valor_total"),
+                                    valor_acatado=prot.get("valor_acatado"),
+                                    qtd_itens_protocolo=prot.get("qtd_itens_protocolo"),
+                                    data_uso=detalhe["data_uso"],
+                                    **consolidado,
+                                ))
+                            except Exception as e:
+                                log.exception("Falha no protocolo %s", prot.get("protocolo"))
+                                capturar_screenshot_erro(rge, f"prot_{prot.get('protocolo')}")
+                                resultados.append(ItemExtraido(
+                                    aba=aba, guia=guia["guia"],
+                                    protocolo=prot.get("protocolo", ""),
+                                    erro=str(e), revisao_manual=True,
+                                ))
+                    except Exception as e:
+                        log.exception("Falha na guia %s (aba %s)", guia.get("guia"), aba)
+                        resultados.append(ItemExtraido(
+                            aba=aba, guia=guia.get("guia", ""),
+                            erro=str(e), revisao_manual=True,
+                        ))
         finally:
             browser.close()
 
+    log.info("Lote %s finalizado: %d registro(s)", req.lote, len(resultados))
     return resultados
 
 
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+# ------------------------------------------------- preenchimento da planilha ----
+#
+# Recriar a planilha a partir de JSON (como o no "JSON -> Excel" do n8n faz)
+# destroi formatacao de data, formato monetario, larguras de coluna, estilos e
+# abas extras. Aqui abrimos o arquivo ORIGINAL e escrevemos apenas nas celulas
+# necessarias, preservando todo o resto.
+
+import json
+from io import BytesIO
+from copy import copy
+from datetime import datetime
+
+import openpyxl
+from fastapi import File, Form, UploadFile
+from fastapi.responses import StreamingResponse
+
+LINHA_CABECALHO = 2
+PRIMEIRA_LINHA_DADOS = 3
+COL_LOTE_PLANILHA = "PROTOCOLO DE ENTREGA"
+COL_PROTOCOLO = "PROTOCOLO RECURSO"
+COL_STATUS = "Status Robô"
+
+
+def _moeda(v):
+    if v in (None, ""):
+        return None
+    limpo = re.sub(r"[^\d,.-]", "", str(v)).replace(".", "").replace(",", ".")
+    try:
+        return float(limpo)
+    except ValueError:
+        return None
+
+
+def _data(v):
+    if not v:
+        return None
+    m = re.match(r"^(\d{1,2})/(\d{1,2})/(\d{4})$", str(v).strip())
+    return datetime(int(m.group(3)), int(m.group(2)), int(m.group(1))) if m else None
+
+
+def _num(v):
+    if v in (None, ""):
+        return None
+    try:
+        return int(str(v).strip())
+    except ValueError:
+        return v
+
+
+def _mapa_colunas(ws) -> Dict[str, int]:
+    return {
+        ws.cell(row=LINHA_CABECALHO, column=c).value: c
+        for c in range(1, ws.max_column + 1)
+        if ws.cell(row=LINHA_CABECALHO, column=c).value
+    }
+
+
+def _garantir_coluna_status(ws, colunas: Dict[str, int]) -> int:
+    if COL_STATUS in colunas:
+        return colunas[COL_STATUS]
+    nova = ws.max_column + 1
+    celula = ws.cell(row=LINHA_CABECALHO, column=nova)
+    celula.value = COL_STATUS
+    modelo = ws.cell(row=LINHA_CABECALHO, column=1)
+    celula.font = copy(modelo.font)
+    celula.fill = copy(modelo.fill)
+    celula.border = copy(modelo.border)
+    celula.alignment = copy(modelo.alignment)
+    colunas[COL_STATUS] = nova
+    return nova
+
+
+COLUNAS_DATA = {"DATA DO RECURSO", "Data uso", "Data Recurso 1", "Data Retorno 1",
+                "Data Recurso 2", "Data Retorno 2"}
+COLUNAS_MOEDA = {"Valor Unit", "Valor total", "Valor Recurso", "Vl Recuperado",
+                 "Valor Pendente"}
+
+
+def _formatos_por_coluna(ws, colunas: Dict[str, int]) -> Dict[str, str]:
+    """Descobre o formato que a planilha ja usa em cada coluna. Celulas vazias
+    nao tem formato, entao escrever nelas sem definir number_format faria a
+    data aparecer como numero de serie (o 45742 que voce viu)."""
+    formatos = {}
+    for nome, col in colunas.items():
+        # Datas sempre em dd/mm/aaaa: a planilha original mistura dd/mm/yy,
+        # mm-dd-yy e texto na mesma coluna, e herdar isso deixaria o resultado
+        # dependente do idioma do Excel de quem abrir.
+        if nome in COLUNAS_DATA:
+            formatos[nome] = "dd/mm/yyyy"
+            continue
+        encontrado = None
+        for r in range(PRIMEIRA_LINHA_DADOS, min(ws.max_row, PRIMEIRA_LINHA_DADOS + 400) + 1):
+            celula = ws.cell(row=r, column=col)
+            if celula.value is not None and celula.number_format != "General":
+                encontrado = celula.number_format
+                break
+        if not encontrado:
+            if nome in COLUNAS_DATA:
+                encontrado = "dd/mm/yy"
+            elif nome in COLUNAS_MOEDA:
+                encontrado = "#,##0.00"
+        if encontrado:
+            formatos[nome] = encontrado
+    return formatos
+
+
+def _copiar_estilo_da_linha(ws, origem: int, destino: int, ultima_coluna: int):
+    for c in range(1, ultima_coluna + 1):
+        de = ws.cell(row=origem, column=c)
+        para = ws.cell(row=destino, column=c)
+        para.font = copy(de.font)
+        para.fill = copy(de.fill)
+        para.border = copy(de.border)
+        para.alignment = copy(de.alignment)
+        para.number_format = de.number_format
+
+
+@app.post("/preencher-planilha")
+async def preencher_planilha(arquivo: UploadFile = File(...), linhas: str = Form(...)):
+    """Recebe a planilha original + os protocolos extraidos e devolve o mesmo
+    arquivo preenchido, com formatacao intacta."""
+    resultados = json.loads(linhas)
+    if isinstance(resultados, dict):
+        resultados = [resultados]
+
+    wb = openpyxl.load_workbook(BytesIO(await arquivo.read()))
+    ws = wb["Modificado"] if "Modificado" in wb.sheetnames else wb[wb.sheetnames[0]]
+
+    colunas = _mapa_colunas(ws)
+    formatos = _formatos_por_coluna(ws, colunas)
+    col_status = _garantir_coluna_status(ws, colunas)
+    ultima_coluna = ws.max_column
+
+    # Onde termina o grupo de cada lote e em que linha esta cada protocolo
+    fim_do_lote: Dict[str, int] = {}
+    linha_do_protocolo: Dict[str, int] = {}
+    lote_atual = None
+    for r in range(PRIMEIRA_LINHA_DADOS, ws.max_row + 1):
+        lote = ws.cell(row=r, column=colunas[COL_LOTE_PLANILHA]).value
+        if lote not in (None, ""):
+            lote_atual = str(lote).strip()
+        if lote_atual:
+            fim_do_lote[lote_atual] = r
+        prot = ws.cell(row=r, column=colunas[COL_PROTOCOLO]).value
+        if prot not in (None, ""):
+            linha_do_protocolo[str(prot).strip()] = r
+
+    atualizadas = criadas = ignoradas = 0
+
+    for res in resultados:
+        protocolo = str(res.get("protocolo") or "").strip()
+        if not protocolo:
+            ignoradas += 1
+            continue
+
+        destino = linha_do_protocolo.get(protocolo)
+        if destino is None:
+            # Protocolo novo: entra logo apos a ultima linha do lote, para
+            # ficar junto dos irmaos em vez de solto no fim da planilha.
+            lote_res = str(res.get("lote") or "").strip()
+            ancora = fim_do_lote.get(lote_res, ws.max_row)
+            destino = ancora + 1
+            ws.insert_rows(destino)
+            _copiar_estilo_da_linha(ws, ancora, destino, ultima_coluna)
+            # Os indices abaixo do ponto de insercao andam uma linha
+            for k, v in list(linha_do_protocolo.items()):
+                if v >= destino:
+                    linha_do_protocolo[k] = v + 1
+            for k, v in list(fim_do_lote.items()):
+                if v >= destino:
+                    fim_do_lote[k] = v + 1
+            if lote_res in fim_do_lote:
+                fim_do_lote[lote_res] = destino
+            linha_do_protocolo[protocolo] = destino
+            criadas += 1
+        else:
+            atualizadas += 1
+
+        valor_recurso = _moeda(res.get("valor_total"))
+        valor_recuperado = _moeda(res.get("valor_acatado"))
+        pendente = (
+            round(valor_recurso - valor_recuperado, 2)
+            if valor_recurso is not None and valor_recuperado is not None
+            else None
+        )
+
+        valores = {
+            "Guia": res.get("guia"),
+            COL_PROTOCOLO: _num(protocolo),
+            "DATA DO RECURSO": _data(res.get("data_recurso")),
+            "Data uso": _data(res.get("data_uso")),
+            "Descrição Item": res.get("descricao_item"),
+            "Codigo Item": _num(res.get("codigo_item")),
+            "Valor Unit": _moeda(res.get("valor_unit")),
+            "Valor total": valor_recurso,
+            "Qtde": res.get("qtde"),
+            "Cod glosa": _num(res.get("cod_glosa")),
+            "Justificativa recurso": res.get("justificativa"),
+            "Valor Recurso": valor_recurso,
+            "Vl Recuperado": valor_recuperado,
+            "Valor Pendente": pendente,
+            "Data Recurso 1": _data(res.get("data_recurso")),
+            "Data Retorno 1": _data(res.get("data_complemento")),
+        }
+
+        for nome, valor in valores.items():
+            col = colunas.get(nome)
+            if col and valor is not None:
+                celula = ws.cell(row=destino, column=col)
+                celula.value = valor
+                if nome in formatos:
+                    celula.number_format = formatos[nome]
+
+        motivo = res.get("erro")
+        ws.cell(row=destino, column=col_status).value = (
+            f"REVISAR: {motivo}" if res.get("revisao_manual") and motivo
+            else ("REVISAR MANUALMENTE" if res.get("revisao_manual") else "OK")
+        )
+
+    # Totais da linha 1 acompanhando o novo tamanho da planilha
+    for letra in ("E", "G", "H", "J"):
+        celula = ws[f"{letra}1"]
+        if celula.value is not None:
+            celula.value = f"=SUBTOTAL(9,{letra}{PRIMEIRA_LINHA_DADOS}:{letra}{ws.max_row})"
+
+    log.info("Planilha preenchida: %d atualizada(s), %d criada(s), %d ignorada(s)",
+             atualizadas, criadas, ignoradas)
+
+    saida = BytesIO()
+    wb.save(saida)
+    saida.seek(0)
+    return StreamingResponse(
+        saida,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": 'attachment; filename="planilha_preenchida.xlsx"'},
+    )
