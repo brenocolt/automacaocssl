@@ -65,6 +65,8 @@ class ItemExtraido(BaseModel):
     data_recurso: Optional[str] = None
     data_complemento: Optional[str] = None
     valor_unit: Optional[str] = None
+    valor_total: Optional[str] = None
+    qtd_itens_protocolo: Optional[str] = None
     data_uso: Optional[str] = None
     descricao_item: Optional[str] = None
     codigo_item: Optional[str] = None
@@ -250,8 +252,51 @@ def ir_para_matmed(rge: Page):
     aguardar_pagina_pronta(rge)
 
 
+def fechar_modal(rge: Page):
+    """Fecha o modal 'Detalhes da Guia' se estiver aberto. Enquanto ele existe,
+    o overlay bloqueia qualquer clique na tela de pesquisa por tras."""
+    try:
+        botao = rge.locator(".ui-dialog-titlebar-close:visible")
+        if botao.count() > 0:
+            botao.first.click(timeout=3000)
+            rge.wait_for_timeout(500)
+    except Exception:
+        try:
+            rge.keyboard.press("Escape")
+            rge.wait_for_timeout(300)
+        except Exception:
+            pass
+
+
+def garantir_tela_de_pesquisa(rge: Page):
+    """Abrir um protocolo tira o robo da tela de pesquisa (e um submit JSF).
+    Antes de cada nova busca, garante que estamos de volta nela."""
+    fechar_modal(rge)
+    if rge.locator(ID_LOTE).count() > 0:
+        return
+
+    for seletor in ['[id="formLink:menuMatMed"]', "#menu2"]:
+        try:
+            rge.locator(seletor).first.click(timeout=8000)
+            aguardar_ajax(rge)
+            aguardar_pagina_pronta(rge)
+            try:  # pode reaparecer o aviso com botao OK
+                rge.get_by_role("button", name=re.compile("^OK$", re.I)).click(timeout=4000)
+                aguardar_ajax(rge)
+            except Exception:
+                pass
+            if rge.locator(ID_LOTE).count() > 0:
+                return
+        except Exception:
+            continue
+
+    caminho = capturar_screenshot_erro(rge, "voltar_pesquisa")
+    raise RuntimeError(f"Nao consegui voltar para a tela de pesquisa. Print: {caminho}")
+
+
 def pesquisar_lote(rge: Page, lote: str, data_inicio: str, data_fim: str):
     try:
+        garantir_tela_de_pesquisa(rge)
         rge.locator(ID_LOTE).fill(lote, timeout=8000)
 
         # CRÍTICO: com esse checkbox marcado, guias já recursadas NÃO aparecem.
@@ -272,10 +317,26 @@ def pesquisar_lote(rge: Page, lote: str, data_inicio: str, data_fim: str):
 
         pausa_humana(rge)
         rge.get_by_role("button", name=re.compile("^Pesquisar$", re.I)).click()
+        aguardar_ajax(rge)
         aguardar_pagina_pronta(rge)
+        esperar_tabela_guias(rge)
     except Exception as e:
         caminho = capturar_screenshot_erro(rge, "pesquisa")
         raise RuntimeError(f"Falha na pesquisa do lote {lote} ({e}). Print: {caminho}")
+
+
+def esperar_tabela_guias(rge: Page, timeout: int = 30000):
+    """Espera a tabela de resultados terminar de renderizar - seja com linhas,
+    seja com a mensagem de 'nenhum item'. Sem isso, ler a tabela cedo demais
+    faz parecer que a busca nao retornou nada."""
+    seletor = (
+        f'[id="{ID_TABELA_GUIAS}_data"] tr[data-ri], '
+        f'[id="{ID_TABELA_GUIAS}_data"] tr.ui-datatable-empty-message'
+    )
+    try:
+        rge.locator(seletor).first.wait_for(timeout=timeout)
+    except Exception:
+        log.warning("Tabela de guias nao renderizou dentro do tempo esperado")
 
 
 def listar_guias(rge: Page) -> List[Dict]:
@@ -307,8 +368,11 @@ def listar_guias(rge: Page) -> List[Dict]:
 
 
 def abrir_detalhes_guia(rge: Page, row_index: int):
+    esperar_tabela_guias(rge)
     linhas = rge.locator(f'[id="{ID_TABELA_GUIAS}_data"] tr[data-ri]')
-    linhas.nth(row_index).click()
+    linha = linhas.nth(row_index)
+    linha.wait_for(timeout=30000)
+    linha.click()
     pausa_humana(rge)
     rge.get_by_role("button", name=re.compile("Detalhes da Guia", re.I)).click()
     aguardar_ajax(rge)
@@ -338,7 +402,9 @@ def listar_protocolos(rge: Page) -> List[Dict]:
             continue
         data_recurso = celulas.nth(3).inner_text().strip()
         data_retorno = celulas.nth(4).inner_text().strip()
-        inf = celulas.nth(7).inner_text().strip()
+        recursado = celulas.nth(5).inner_text().strip()   # -> "Valor total"
+        qtd_itens = celulas.nth(6).inner_text().strip()
+        inf = celulas.nth(7).inner_text().strip()         # -> "Valor Unit"
 
         # So a linha de ENVIO abre a tela com a tabela de itens
         eh_envio = linha.locator(f'[id$=":{i}:linkVisualizarRecurso"]').count() > 0
@@ -355,6 +421,10 @@ def listar_protocolos(rge: Page) -> List[Dict]:
             entry["data_complemento"] = data_retorno
         if inf and not entry.get("valor_unit"):
             entry["valor_unit"] = inf
+        if recursado and not entry.get("valor_total"):
+            entry["valor_total"] = recursado
+        if qtd_itens and not entry.get("qtd_itens_protocolo"):
+            entry["qtd_itens_protocolo"] = qtd_itens
 
     return [protocolos[p] for p in ordem]
 
@@ -378,41 +448,89 @@ def abrir_visualizar_protocolo(rge: Page, row_index: int) -> Dict:
         for i in range(linhas.count()):
             celulas = linhas.nth(i).locator("td")
             textos = [celulas.nth(c).inner_text().strip() for c in range(celulas.count())]
-            if not textos:
-                continue
-            cod_servico = next((t for t in textos if " - " in t), "")
-            codigo, _, descricao = cod_servico.partition(" - ")
-            numeros = [t for t in textos if t.replace(".", "").isdigit()]
-            itens.append({
-                "codigo": codigo.strip().lstrip("0") or "0",
-                "descricao": descricao.strip(),
-                "cod_glosa": numeros[1] if len(numeros) > 1 else "",
-                "qtde": int(numeros[-1]) if numeros and numeros[-1].isdigit() else 0,
-                "justificativa": "",
-                "_colunas_cruas": textos,
-            })
+            itens.append(_extrair_item(textos))
     except Exception as e:
         log.warning("Nao consegui ler a tabela de itens: %s", e)
 
     return {"data_uso": data_uso, "itens": itens}
 
 
+def _limpar_justificativa(texto: str) -> str:
+    """A celula vem como 'Justificativa\n\t\t...\n\tItem recursado - ...'.
+    Queremos so o texto final."""
+    linhas = [l.strip() for l in texto.splitlines() if l.strip()]
+    linhas = [l for l in linhas if l.lower() != "justificativa"]
+    return linhas[-1] if linhas else ""
+
+
+def _extrair_item(textos: List[str]) -> Dict:
+    """A tabela usa colunas congeladas, entao a primeira celula repete a linha
+    inteira. Em vez de indices fixos, localizamos a celula do 'Cod. Servico'
+    (a unica com ' - ') e lemos as seguintes por deslocamento:
+        Cod. Servico | Cod. Glosa | Valor Glosado | Qtde
+    A justificativa e a celula que contem a palavra 'Justificativa'."""
+    idx_servico = None
+    for i, t in enumerate(textos):
+        if " - " in t and "\n" not in t:
+            idx_servico = i
+            break
+
+    def pos(offset: int) -> str:
+        if idx_servico is None:
+            return ""
+        j = idx_servico + offset
+        return textos[j] if 0 <= j < len(textos) else ""
+
+    cod_servico = pos(0)
+    codigo, _, descricao = cod_servico.partition(" - ")
+    qtde_txt = pos(3)
+
+    justificativa = ""
+    for t in textos:
+        if "justificativa" in t.lower():
+            justificativa = _limpar_justificativa(t)
+            break
+
+    return {
+        "seq": pos(-1),
+        "codigo": codigo.strip().lstrip("0") or "0",
+        "descricao": descricao.strip(),
+        "cod_glosa": pos(1),
+        "valor_glosado": pos(2),
+        "qtde": int(qtde_txt) if qtde_txt.isdigit() else 0,
+        "justificativa": justificativa,
+        "_colunas_cruas": textos,
+    }
+
+
 def consolidar_itens(itens: List[Dict]) -> Dict:
-    """Um protocolo vira UMA linha na planilha (ver spec, seção 5.2)."""
+    """Regra confirmada com o cliente: um protocolo vira UMA linha na planilha,
+    usando os dados do PRIMEIRO item. Isso e valido porque a justificativa e a
+    mesma para todos os itens do protocolo (a soma dos itens forma o valor da
+    glosa, que fica no campo 'Valor total').
+
+    Se as justificativas divergirem, a premissa cai por terra e a linha e
+    sinalizada para revisao em vez de gravar um dado enganoso."""
     if not itens:
         return {"revisao_manual": True, "erro": "Nenhum item encontrado no protocolo"}
-    tipos = {(it["codigo"], it["descricao"]) for it in itens}
-    if len(tipos) > 1:
-        return {"revisao_manual": True, "erro": "Protocolo com itens de códigos diferentes"}
+
+    justificativas = {it["justificativa"] for it in itens if it["justificativa"]}
     base = itens[0]
-    return {
+    resultado = {
         "descricao_item": base["descricao"],
         "codigo_item": base["codigo"],
         "cod_glosa": base["cod_glosa"],
-        "qtde": sum(it["qtde"] for it in itens),
+        "qtde": base["qtde"],          # do 1o item, nao a soma (confirmado)
         "justificativa": base["justificativa"],
         "revisao_manual": False,
     }
+    if len(justificativas) > 1:
+        resultado["revisao_manual"] = True
+        resultado["erro"] = (
+            f"Protocolo com {len(justificativas)} justificativas diferentes "
+            f"entre os itens - conferir manualmente"
+        )
+    return resultado
 
 
 # --------------------------------------------------------------- endpoint ----
@@ -461,6 +579,7 @@ def processar_lote(req: ProcessarLoteRequest):
                                 data_recurso=prot.get("data_recurso"),
                                 data_complemento=prot.get("data_complemento"),
                                 valor_unit=prot.get("valor_unit"),
+                                valor_total=prot.get("valor_total"),
                                 revisao_manual=True,
                                 erro="Protocolo sem linha de envio (so retorno)",
                             ))
@@ -475,6 +594,8 @@ def processar_lote(req: ProcessarLoteRequest):
                                 data_recurso=prot.get("data_recurso"),
                                 data_complemento=prot.get("data_complemento"),
                                 valor_unit=prot.get("valor_unit"),
+                                valor_total=prot.get("valor_total"),
+                                qtd_itens_protocolo=prot.get("qtd_itens_protocolo"),
                                 data_uso=detalhe["data_uso"],
                                 **consolidado,
                             ))
