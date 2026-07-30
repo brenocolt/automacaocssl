@@ -680,7 +680,30 @@ def abrir_visualizar_protocolo(rge: Page, row_index: int) -> Dict:
     except Exception as e:
         log.warning("Nao consegui ler a tabela de itens: %s", e)
 
-    return {"data_uso": data_uso, "itens": itens}
+    protocolo_info = _dados_do_protocolo(rge) if not itens else {}
+
+    return {"data_uso": data_uso, "itens": itens, "protocolo_info": protocolo_info}
+
+
+def _dados_do_protocolo(rge: Page) -> Dict:
+    """Quando o recurso e feito para a guia inteira (Obj. do recurso = "Guia"),
+    a tela nao tem tabela de itens: traz um bloco unico com a justificativa e o
+    valor total. Sem ler isso, esses protocolos ficavam totalmente vazios."""
+    try:
+        return rge.evaluate(r"""() => {
+            const texto = document.body.innerText || '';
+            const achar = (re) => { const m = texto.match(re); return m ? m[1].trim() : ''; };
+            return {
+                justificativa: achar(/Justificativa:?\s*\n+([\s\S]{1,800}?)(?:\n\s*\n|$)/i)
+                            || achar(/Observa[çc][ãa]o:?\s*\n+([\s\S]{1,800}?)(?:\n\s*\n|$)/i),
+                valor_total: achar(/Valor Total Recursado:?\s*(R\$\s*[\d.,]+)/i),
+                objeto: achar(/Obj\. do recurso de glosa:?\s*\n*\s*([^\n]{1,40})/i),
+                num_guia_prestador: achar(/N[ºo°]\s*da guia no prestador:?\s*\n*\s*(\d+)/i),
+            };
+        }""")
+    except Exception as e:
+        log.warning("Nao consegui ler os dados do protocolo: %s", e)
+        return {}
 
 
 def _localizar_tabela_itens(rge: Page):
@@ -779,7 +802,7 @@ def _extrair_item(textos: List[str], justificativa_externa: str = "") -> Dict:
     }
 
 
-def consolidar_itens(itens: List[Dict]) -> Dict:
+def consolidar_itens(itens: List[Dict], protocolo_info: Optional[Dict] = None) -> Dict:
     """Regra confirmada com o cliente: um protocolo vira UMA linha na planilha,
     usando os dados do PRIMEIRO item. Isso e valido porque a justificativa e a
     mesma para todos os itens do protocolo (a soma dos itens forma o valor da
@@ -788,6 +811,21 @@ def consolidar_itens(itens: List[Dict]) -> Dict:
     Se as justificativas divergirem, a premissa cai por terra e a linha e
     sinalizada para revisao em vez de gravar um dado enganoso."""
     if not itens:
+        # Recurso feito para a guia inteira: nao existe tabela de itens, mas a
+        # justificativa e o valor estao no bloco do protocolo. Isso e situacao
+        # normal do portal, nao erro - por isso nao vai para revisao manual.
+        info = protocolo_info or {}
+        justificativa = info.get("justificativa", "")
+        if justificativa or info.get("valor_total"):
+            return {
+                "descricao_item": None,
+                "codigo_item": None,
+                "cod_glosa": None,
+                "qtde": None,
+                "justificativa": justificativa,
+                "revisao_manual": False,
+                "erro": f"Recurso no nivel da guia ({info.get('objeto') or 'sem itens'})",
+            }
         return {"revisao_manual": True, "erro": "Nenhum item encontrado no protocolo"}
 
     justificativas = {it["justificativa"] for it in itens if it["justificativa"]}
@@ -880,7 +918,7 @@ def processar_lote(req: ProcessarLoteRequest):
                             try:
                                 preparar(guia["row_index"])
                                 detalhe = abrir_visualizar_protocolo(rge, prot["row_index"])
-                                consolidado = consolidar_itens(detalhe["itens"])
+                                consolidado = consolidar_itens(detalhe["itens"], detalhe.get("protocolo_info"))
                                 resultados.append(ItemExtraido(
                                     aba=aba,
                                     guia=guia["guia"],
@@ -888,7 +926,8 @@ def processar_lote(req: ProcessarLoteRequest):
                                     data_recurso=prot.get("data_recurso"),
                                     data_complemento=prot.get("data_complemento"),
                                     valor_unit=prot.get("valor_unit"),
-                                    valor_total=prot.get("valor_total"),
+                                    valor_total=(prot.get("valor_total")
+                                                 or (detalhe.get("protocolo_info") or {}).get("valor_total")),
                                     valor_acatado=prot.get("valor_acatado"),
                                     qtd_itens_protocolo=prot.get("qtd_itens_protocolo"),
                                     data_uso=detalhe["data_uso"],
