@@ -17,6 +17,7 @@ import os
 import re
 import time
 import logging
+import threading
 from datetime import date
 from calendar import monthrange
 from typing import Optional, List, Dict
@@ -60,6 +61,12 @@ IDS_DATA_REALIZACAO = (
 )
 
 app = FastAPI(title="Bot Recurso de Glosa - SulAmérica")
+
+# O n8n dispara varios lotes em paralelo e cada um abriria um Chromium.
+# Isso esgotava a memoria da VPS e fazia o portal recusar conexoes - dai a
+# enxurrada de "Page.goto: Timeout" no login. Uma execucao por vez resolve.
+_EXECUCOES_SIMULTANEAS = int(os.environ.get("MAX_EXECUCOES_SIMULTANEAS", "1"))
+_semaforo = threading.Semaphore(_EXECUCOES_SIMULTANEAS)
 
 
 class SemResultados(Exception):
@@ -229,8 +236,24 @@ def preencher_data_primefaces(page: Page, base_id: str, valor: str):
 
 # -------------------------------------------------------- passos do fluxo ----
 
-def fazer_login(page: Page):
-    page.goto(PORTAL_URL)
+def fazer_login(page: Page, tentativas: int = 3):
+    """O portal fica intermitente sob carga. Em vez de falhar de primeira,
+    tenta de novo com espera crescente."""
+    ultimo_erro = None
+    for tentativa in range(1, tentativas + 1):
+        try:
+            page.goto(PORTAL_URL, timeout=60000, wait_until="domcontentloaded")
+            ultimo_erro = None
+            break
+        except Exception as e:
+            ultimo_erro = e
+            espera = 3000 * tentativa
+            log.warning("Login tentativa %d/%d falhou (%s); aguardando %dms",
+                        tentativa, tentativas, type(e).__name__, espera)
+            page.wait_for_timeout(espera)
+    if ultimo_erro:
+        raise RuntimeError(f"Portal inacessivel apos {tentativas} tentativas: {ultimo_erro}")
+
     aguardar_pagina_pronta(page)
     fechar_banner_cookies(page)
     try:
@@ -633,6 +656,10 @@ def listar_guias(rge: Page) -> List[Dict]:
 
 
 def abrir_detalhes_guia(rge: Page, row_index: int):
+    # O modal da guia anterior fica aberto e seu overlay intercepta o clique
+    # na proxima linha. Era a causa das falhas em cascata: a primeira guia do
+    # lote funcionava e todas as seguintes davam timeout de 30s.
+    fechar_modal(rge)
     esperar_tabela_guias(rge)
     linhas = rge.locator(f'[id="{ID_TABELA_GUIAS}_data"] tr[data-ri]')
     linha = linhas.nth(row_index)
@@ -1138,6 +1165,20 @@ def processar_lote(req: ProcessarLoteRequest):
     resultados: List[ItemExtraido] = []
     metricas = {"buscas": 0, "retornos_rapidos": 0, "retornos_lentos": 0}
 
+    espera_fila = time.time()
+    _semaforo.acquire()
+    fila = time.time() - espera_fila
+    if fila > 1:
+        log.info("Lote %s aguardou %.0fs na fila", req.lote, fila)
+
+    try:
+        return _processar(req, resultados, metricas)
+    finally:
+        _semaforo.release()
+
+
+def _processar(req: ProcessarLoteRequest, resultados: List[ItemExtraido],
+               metricas: Dict) -> List[ItemExtraido]:
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=HEADLESS)
         page = browser.new_context().new_page()
