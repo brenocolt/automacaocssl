@@ -15,6 +15,7 @@ atributo [id="..."] em vez de #id (que exigiria escapar os dois-pontos).
 
 import os
 import re
+import time
 import logging
 from datetime import date
 from calendar import monthrange
@@ -557,59 +558,121 @@ def abrir_detalhes_guia(rge: Page, row_index: int):
 
 
 def listar_protocolos(rge: Page) -> List[Dict]:
-    """Modal 'Detalhes da Guia'. Cada protocolo aparece em duas linhas:
-    envio (link 'linkVisualizarRecurso', Data Retorno vazia) e retorno
-    (link 'linkVisualizarRetorno', Data Retorno preenchida). Agrupamos as
-    duas pelo numero do protocolo.
-    Colunas: 0 Tipo | 1 Status | 2 Protocolo | 3 Data Recurso |
-             4 Data Retorno | 5 Recursado | 6 Qtd Itens | 7 Inf | 8 Lib |
-             9 Acatado | 10 Prazo"""
-    linhas = rge.locator(f'[id="{ID_TABELA_RECURSOS}_data"] tr[data-ri]')
+    """Modal 'Detalhes da Guia'. Cada protocolo aparece em duas linhas: envio
+    (link 'linkVisualizarRecurso') e retorno (link 'linkVisualizarRetorno').
+    Agrupamos as duas pelo numero do protocolo.
+
+    As colunas sao localizadas pelo CABECALHO, nao por indice fixo: as duas
+    abas tem layouts diferentes, e ler a coluna errada produzia valores altos
+    demais e repetidos entre guias, sem nenhum erro aparente."""
+    dados = rge.evaluate(
+        r"""(idTabela) => {
+            const tabela = document.getElementById(idTabela)
+                        || document.getElementById(idTabela + '_data')?.closest('div.ui-datatable');
+            if (!tabela) return null;
+
+            const normalizar = (s) => (s || '')
+                .normalize('NFD').replace(/[̀-ͯ]/g, '')
+                .replace(/\s+/g, ' ').trim().toLowerCase();
+
+            const cabecalhos = Array.from(tabela.querySelectorAll('thead th'))
+                .map(th => normalizar(th.innerText));
+
+            const acharCol = (...alvos) => {
+                for (const alvo of alvos) {
+                    const i = cabecalhos.findIndex(h => h.includes(alvo));
+                    if (i >= 0) return i;
+                }
+                return -1;
+            };
+
+            const col = {
+                protocolo: acharCol('protocolo'),
+                dataRecurso: acharCol('data recurso', 'data do recurso'),
+                dataRetorno: acharCol('complemento', 'data retorno', 'retorno'),
+                recursado: acharCol('recursado'),
+                qtdItens: acharCol('quantidade de itens', 'qtd de itens', 'itens'),
+                inf: acharCol('inf'),
+                acatado: acharCol('acatado'),
+            };
+
+            const corpo = tabela.querySelector('tbody[id$="_data"]') || tabela.querySelector('tbody');
+            const linhas = Array.from(corpo ? corpo.querySelectorAll('tr[data-ri]') : []);
+
+            return {
+                cabecalhos,
+                colunas: col,
+                linhas: linhas.map((tr, i) => {
+                    const tds = Array.from(tr.querySelectorAll('td'))
+                        .map(td => (td.innerText || '').trim());
+                    const pegar = (idx) => (idx >= 0 && idx < tds.length) ? tds[idx] : '';
+                    return {
+                        indice: parseInt(tr.getAttribute('data-ri'), 10),
+                        protocolo: pegar(col.protocolo),
+                        dataRecurso: pegar(col.dataRecurso),
+                        dataRetorno: pegar(col.dataRetorno),
+                        recursado: pegar(col.recursado),
+                        qtdItens: pegar(col.qtdItens),
+                        inf: pegar(col.inf),
+                        acatado: pegar(col.acatado),
+                        ehEnvio: !!tr.querySelector('[id*="linkVisualizarRecurso"]'),
+                        celulas: tds,
+                    };
+                }),
+            };
+        }""",
+        ID_TABELA_RECURSOS,
+    )
+
+    if not dados:
+        log.warning("Tabela de recursos nao encontrada no modal")
+        return []
+
+    faltando = [k for k, v in dados["colunas"].items() if v < 0]
+    if faltando:
+        log.warning("Colunas nao localizadas pelo cabecalho: %s | cabecalhos: %s",
+                    faltando, dados["cabecalhos"])
+
     protocolos: Dict[str, Dict] = {}
     ordem: List[str] = []
 
-    for i in range(linhas.count()):
-        linha = linhas.nth(i)
-        celulas = linha.locator("td")
-        if celulas.count() < 8:
-            continue
-        protocolo = celulas.nth(2).inner_text().strip()
+    for linha in dados["linhas"]:
+        protocolo = (linha.get("protocolo") or "").strip()
         if not protocolo:
             continue
-        data_recurso = celulas.nth(3).inner_text().strip()
-        data_retorno = celulas.nth(4).inner_text().strip()
-        recursado = celulas.nth(5).inner_text().strip()   # -> "Valor total"
-        qtd_itens = celulas.nth(6).inner_text().strip()
-        inf = celulas.nth(7).inner_text().strip()         # -> "Valor Unit"
-        acatado = celulas.nth(9).inner_text().strip()     # -> "Vl Recuperado"
-
-        # So a linha de ENVIO abre a tela com a tabela de itens
-        eh_envio = linha.locator(f'[id$=":{i}:linkVisualizarRecurso"]').count() > 0
 
         if protocolo not in protocolos:
             protocolos[protocolo] = {"protocolo": protocolo, "row_index": None}
             ordem.append(protocolo)
         entry = protocolos[protocolo]
-        if eh_envio and entry["row_index"] is None:
-            entry["row_index"] = i
-        if data_recurso and not entry.get("data_recurso"):
-            entry["data_recurso"] = data_recurso
-        if data_retorno:
-            entry["data_complemento"] = data_retorno
-        if inf and not entry.get("valor_unit"):
-            entry["valor_unit"] = inf
-        if recursado and not entry.get("valor_total"):
-            entry["valor_total"] = recursado
-        if qtd_itens and not entry.get("qtd_itens_protocolo"):
-            entry["qtd_itens_protocolo"] = qtd_itens
-        if acatado and not entry.get("valor_acatado"):
-            entry["valor_acatado"] = acatado
+
+        if linha.get("ehEnvio") and entry["row_index"] is None:
+            entry["row_index"] = linha["indice"]
+
+        for chave_origem, chave_destino in (
+            ("dataRecurso", "data_recurso"),
+            ("dataRetorno", "data_complemento"),
+            ("inf", "valor_unit"),
+            ("recursado", "valor_total"),
+            ("qtdItens", "qtd_itens_protocolo"),
+            ("acatado", "valor_acatado"),
+        ):
+            valor = (linha.get(chave_origem) or "").strip()
+            if valor and not entry.get(chave_destino):
+                entry[chave_destino] = valor
 
     return [protocolos[p] for p in ordem]
 
 
-def abrir_visualizar_protocolo(rge: Page, row_index: int) -> Dict:
-    """Clica no link de envio da linha e le a tela 'Visualizar protocolo'."""
+def abrir_visualizar_protocolo(rge: Page, row_index: int, voltar: bool = True) -> Dict:
+    """Abre a tela 'Visualizar protocolo' e, ao final, tenta VOLTAR pelo
+    historico do navegador.
+
+    Isso e o que torna o processo rapido: sem voltar, cada protocolo obrigava a
+    refazer login->aba->filtros->pesquisa->modal. Voltando, a busca e o modal
+    continuam validos e o proximo protocolo e so mais um clique.
+    O chamador confere se deu certo (funcao voltou_para_modal) e refaz a busca
+    apenas quando o retorno falha."""
     rge.locator(f'[id="{ID_TABELA_RECURSOS}:{row_index}:linkVisualizarRecurso"]').click()
     aguardar_ajax(rge)
     aguardar_pagina_pronta(rge)
@@ -682,23 +745,86 @@ def abrir_visualizar_protocolo(rge: Page, row_index: int) -> Dict:
 
     protocolo_info = _dados_do_protocolo(rge) if not itens else {}
 
-    return {"data_uso": data_uso, "itens": itens, "protocolo_info": protocolo_info}
+    voltou = False
+    if voltar:
+        try:
+            rge.go_back()
+            aguardar_ajax(rge)
+            aguardar_pagina_pronta(rge)
+            voltou = modal_de_recursos_visivel(rge)
+        except Exception as e:
+            log.info("Nao consegui voltar pelo historico: %s", e)
+
+    return {
+        "data_uso": data_uso,
+        "itens": itens,
+        "protocolo_info": protocolo_info,
+        "voltou": voltou,
+    }
+
+
+def modal_de_recursos_visivel(rge: Page) -> bool:
+    """Confirma que a tabela de protocolos continua na tela e utilizavel."""
+    try:
+        tabela = rge.locator(f'[id="{ID_TABELA_RECURSOS}_data"] tr[data-ri]')
+        return tabela.count() > 0 and tabela.first.is_visible()
+    except Exception:
+        return False
 
 
 def _dados_do_protocolo(rge: Page) -> Dict:
     """Quando o recurso e feito para a guia inteira (Obj. do recurso = "Guia"),
-    a tela nao tem tabela de itens: traz um bloco unico com a justificativa e o
-    valor total. Sem ler isso, esses protocolos ficavam totalmente vazios."""
+    a tela nao tem tabela de itens: traz um bloco unico com a justificativa.
+
+    Le pelo DOM, nao por regex no texto da pagina: varrer innerText fazia a
+    justificativa vir com o rodape do site junto ("Voltar / Visualizar Retorno
+    / Copyright SulAmerica")."""
     try:
         return rge.evaluate(r"""() => {
-            const texto = document.body.innerText || '';
-            const achar = (re) => { const m = texto.match(re); return m ? m[1].trim() : ''; };
+            const limpar = (s) => (s || '')
+                .replace(/\s*\n\s*/g, ' ')
+                .replace(/\s{2,}/g, ' ')
+                .trim();
+
+            // Lixo de rodape/navegacao que nunca faz parte da justificativa
+            const LIXO = /(Voltar|Visualizar Retorno|Copyright|SulAm[ée]rica\s*-\s*\d|Imprimir)/i;
+            const cortarLixo = (s) => {
+                let t = limpar(s);
+                const m = t.match(LIXO);
+                if (m && m.index > 0) t = t.slice(0, m.index);
+                return t.replace(/[\s.;,-]+$/, '').trim();
+            };
+
+            // A justificativa fica na celula/bloco IRMAO do rotulo, nao no
+            // corpo inteiro da pagina.
+            let justificativa = '';
+            const rotulos = Array.from(
+                document.querySelectorAll('td, th, div, span, label, p')
+            ).filter(el => /^(Justificativa|Observa[çc][ãa]o)\s*:?$/i.test((el.innerText||'').trim()));
+
+            for (const rot of rotulos) {
+                const candidatos = [
+                    rot.nextElementSibling,
+                    rot.parentElement ? rot.parentElement.nextElementSibling : null,
+                ];
+                for (const c of candidatos) {
+                    if (!c) continue;
+                    const txt = cortarLixo(c.innerText);
+                    if (txt && txt.length > 3) { justificativa = txt; break; }
+                }
+                if (justificativa) break;
+            }
+
+            const acharValor = (re) => {
+                const m = (document.body.innerText || '').match(re);
+                return m ? m[1].trim() : '';
+            };
+
             return {
-                justificativa: achar(/Justificativa:?\s*\n+([\s\S]{1,800}?)(?:\n\s*\n|$)/i)
-                            || achar(/Observa[çc][ãa]o:?\s*\n+([\s\S]{1,800}?)(?:\n\s*\n|$)/i),
-                valor_total: achar(/Valor Total Recursado:?\s*(R\$\s*[\d.,]+)/i),
-                objeto: achar(/Obj\. do recurso de glosa:?\s*\n*\s*([^\n]{1,40})/i),
-                num_guia_prestador: achar(/N[ºo°]\s*da guia no prestador:?\s*\n*\s*(\d+)/i),
+                justificativa,
+                valor_total: acharValor(/Valor Total Recursado:?\s*(R\$\s*[\d.,]+)/i),
+                objeto: acharValor(/Obj\. do recurso de glosa:?\s*\n*\s*([^\n]{1,40})/i),
+                num_guia_prestador: acharValor(/N[ºo°]\s*da guia no prestador:?\s*\n*\s*(\d+)/i),
             };
         }""")
     except Exception as e:
@@ -726,16 +852,40 @@ def _localizar_tabela_itens(rge: Page):
     return None
 
 
+LIXO_RODAPE = re.compile(
+    r"(Voltar|Visualizar Retorno|Copyright|SulAm[ée]rica\s*-\s*\d|Imprimir)", re.I
+)
+
+
 def _limpar_justificativa(texto: str) -> str:
-    """O texto vem com o rotulo junto: em varias linhas no Mat/Med
-    ('Justificativa\\n...\\nItem recursado - ...') e numa linha so na aba
-    Itens ('Justificativa Solicito reanalise...')."""
+    """Tira o rotulo, o rodape do site e placeholders.
+
+    O texto chega de tres formas: varias linhas no Mat/Med, linha unica na aba
+    Itens, e as vezes so um traco - que e placeholder de "sem justificativa",
+    nao conteudo, e por isso vira string vazia."""
     if not texto:
         return ""
+
     linhas = [l.strip() for l in texto.splitlines() if l.strip()]
     linhas = [l for l in linhas if l.lower() != "justificativa"]
-    resultado = linhas[-1] if linhas else ""
-    return re.sub(r"^justificativa[:\s]*", "", resultado, flags=re.I).strip()
+    # Descarta linhas que sao so rodape/navegacao antes de escolher o conteudo
+    linhas = [l for l in linhas if not LIXO_RODAPE.fullmatch(l.strip())
+              and not LIXO_RODAPE.match(l.strip())]
+    resultado = " ".join(linhas) if len(linhas) <= 1 else linhas[-1]
+
+    resultado = re.sub(r"^(justificativa|observa[çc][ãa]o)[:\s]*", "", resultado, flags=re.I)
+
+    corte = LIXO_RODAPE.search(resultado)
+    if corte and corte.start() > 0:
+        resultado = resultado[: corte.start()]
+
+    resultado = re.sub(r"\s{2,}", " ", resultado).strip()
+
+    # "-", "--", "." isolados sao placeholder do portal, nao justificativa
+    if len(resultado) <= 2 or not re.search(r"[A-Za-zÀ-ÿ]", resultado):
+        return ""
+
+    return resultado
 
 
 def _extrair_item(textos: List[str], justificativa_externa: str = "") -> Dict:
@@ -852,17 +1002,19 @@ def consolidar_itens(itens: List[Dict], protocolo_info: Optional[Dict] = None) -
 
 @app.post("/processar-lote", response_model=List[ItemExtraido])
 def processar_lote(req: ProcessarLoteRequest):
-    """Percorre AS DUAS abas (Mat/Med e Itens). Confirmado com o cliente: a
-    planilha reune protocolos das duas, e buscar so em Mat/Med deixava cerca
-    de dois tercos dos protocolos de fora.
+    """Percorre as duas abas (Mat/Med e Itens) para o lote informado.
 
-    Abrir um protocolo e um submit JSF que descarta a busca; por isso a
-    pesquisa e refeita antes de cada protocolo."""
+    DESEMPENHO: abrir um protocolo e um submit JSF que tira o robo da tela de
+    resultados. Refazer a busca a cada protocolo custava ~18 pesquisas por
+    lote. Agora tentamos voltar pelo historico do navegador, o que preserva a
+    busca e o modal - a busca so e refeita quando o retorno falha."""
     resultados: List[ItemExtraido] = []
+    metricas = {"buscas": 0, "retornos_rapidos": 0, "retornos_lentos": 0}
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=HEADLESS)
         page = browser.new_context().new_page()
+        inicio_exec = time.time()
         try:
             try:
                 fazer_login(page)
@@ -881,32 +1033,37 @@ def processar_lote(req: ProcessarLoteRequest):
                     ))
                     continue
 
-                def preparar(guia_index: Optional[int] = None, _aba=aba):
+                def buscar(_aba=aba):
+                    metricas["buscas"] += 1
                     pesquisar_lote(rge, req.lote, req.data_inicio_pagto,
                                    req.data_fim_pagto, _aba)
-                    if guia_index is not None:
-                        abrir_detalhes_guia(rge, guia_index)
 
                 try:
-                    preparar()
+                    buscar()
                     guias = listar_guias(rge)
                 except Exception as e:
-                    # Lote sem nada nesta aba e situacao normal, nao erro.
+                    # Lote sem nada nesta aba e normal, nao erro
                     log.info("Aba %s, lote %s: sem resultados (%s)", aba, req.lote, e)
+                    continue
+
+                if not guias:
+                    log.info("Aba %s, lote %s: nenhuma guia", aba, req.lote)
                     continue
 
                 log.info("Aba %s, lote %s: %d guia(s)", aba, req.lote, len(guias))
 
                 for guia in guias:
+                    rotulo = guia.get("guia", "")
                     try:
-                        preparar(guia["row_index"])
+                        abrir_detalhes_guia(rge, guia["row_index"])
                         protocolos = listar_protocolos(rge)
-                        log.info("  guia %s: %d protocolo(s)", guia["guia"], len(protocolos))
+                        log.info("  guia %s: %d protocolo(s)", rotulo, len(protocolos))
 
+                        modal_valido = True
                         for prot in protocolos:
                             if prot.get("row_index") is None:
                                 resultados.append(ItemExtraido(
-                                    aba=aba, guia=guia["guia"], protocolo=prot["protocolo"],
+                                    aba=aba, guia=rotulo, protocolo=prot["protocolo"],
                                     data_recurso=prot.get("data_recurso"),
                                     data_complemento=prot.get("data_complemento"),
                                     valor_unit=prot.get("valor_unit"),
@@ -915,13 +1072,25 @@ def processar_lote(req: ProcessarLoteRequest):
                                     erro="Protocolo sem linha de envio (so retorno)",
                                 ))
                                 continue
+
                             try:
-                                preparar(guia["row_index"])
+                                # Refaz a busca apenas se o retorno rapido falhou
+                                if not modal_valido:
+                                    buscar()
+                                    abrir_detalhes_guia(rge, guia["row_index"])
+                                    metricas["retornos_lentos"] += 1
+
                                 detalhe = abrir_visualizar_protocolo(rge, prot["row_index"])
-                                consolidado = consolidar_itens(detalhe["itens"], detalhe.get("protocolo_info"))
+                                modal_valido = detalhe.get("voltou", False)
+                                if modal_valido:
+                                    metricas["retornos_rapidos"] += 1
+
+                                consolidado = consolidar_itens(
+                                    detalhe["itens"], detalhe.get("protocolo_info")
+                                )
                                 resultados.append(ItemExtraido(
                                     aba=aba,
-                                    guia=guia["guia"],
+                                    guia=rotulo,
                                     protocolo=prot["protocolo"],
                                     data_recurso=prot.get("data_recurso"),
                                     data_complemento=prot.get("data_complemento"),
@@ -937,20 +1106,25 @@ def processar_lote(req: ProcessarLoteRequest):
                                 log.exception("Falha no protocolo %s", prot.get("protocolo"))
                                 capturar_screenshot_erro(rge, f"prot_{prot.get('protocolo')}")
                                 resultados.append(ItemExtraido(
-                                    aba=aba, guia=guia["guia"],
+                                    aba=aba, guia=rotulo,
                                     protocolo=prot.get("protocolo", ""),
                                     erro=str(e), revisao_manual=True,
                                 ))
+                                modal_valido = False
                     except Exception as e:
-                        log.exception("Falha na guia %s (aba %s)", guia.get("guia"), aba)
+                        log.exception("Falha na guia %s (aba %s)", rotulo, aba)
                         resultados.append(ItemExtraido(
-                            aba=aba, guia=guia.get("guia", ""),
-                            erro=str(e), revisao_manual=True,
+                            aba=aba, guia=rotulo, erro=str(e), revisao_manual=True,
                         ))
         finally:
             browser.close()
 
-    log.info("Lote %s finalizado: %d registro(s)", req.lote, len(resultados))
+    duracao = time.time() - inicio_exec
+    log.info(
+        "Lote %s: %d registro(s) em %.0fs | %d busca(s), %d retorno(s) rapido(s), %d lento(s)",
+        req.lote, len(resultados), duracao,
+        metricas["buscas"], metricas["retornos_rapidos"], metricas["retornos_lentos"],
+    )
     return resultados
 
 
@@ -1112,6 +1286,20 @@ async def preencher_planilha(arquivo: UploadFile = File(...), linhas: str = Form
         protocolo = str(res.get("protocolo") or "").strip()
         if not protocolo:
             ignoradas += 1
+            continue
+
+        # Protocolo sem NENHUM dado util nao vira linha: so gera ruido na
+        # planilha, marcado como OK sem conteudo algum.
+        tem_conteudo = any(
+            res.get(campo) for campo in (
+                "data_recurso", "data_complemento", "valor_unit", "valor_total",
+                "data_uso", "descricao_item", "codigo_item", "cod_glosa",
+                "qtde", "justificativa",
+            )
+        )
+        if not tem_conteudo and not res.get("erro"):
+            ignoradas += 1
+            log.info("Protocolo %s ignorado: sem dados", protocolo)
             continue
 
         destino = linha_do_protocolo.get(protocolo)
