@@ -290,6 +290,7 @@ def ir_para_aba(rge: Page, aba: str):
         pass
     aguardar_ajax(rge)
     aguardar_pagina_pronta(rge)
+    fechar_modal(rge)   # comunicado do Mat/Med bloqueia os cliques seguintes
 
 
 # Mantido para o inspecionar.py continuar funcionando
@@ -298,17 +299,59 @@ def ir_para_matmed(rge: Page):
 
 
 def fechar_modal(rge: Page):
-    """Fecha o modal 'Detalhes da Guia' se estiver aberto. Enquanto ele existe,
-    o overlay bloqueia qualquer clique na tela de pesquisa por tras."""
-    try:
-        botao = rge.locator(".ui-dialog-titlebar-close:visible")
-        if botao.count() > 0:
-            botao.first.click(timeout=3000)
-            rge.wait_for_timeout(500)
-    except Exception:
+    """Fecha QUALQUER dialogo do PrimeFaces que esteja aberto.
+
+    Ao entrar no Mat/Med o portal exibe um modal de comunicado
+    (modalComunicadoRecursarMatMed) cujo overlay intercepta os cliques. Como
+    ele nao usa o mesmo botao dos demais, o robo ficava 30s tentando clicar em
+    "Pesquisar" e desistia - e, por ser tratado como "aba sem resultados", a
+    falha passava despercebida."""
+    for _ in range(3):
+        try:
+            aberto = rge.evaluate(
+                """() => Array.from(document.querySelectorAll('.ui-widget-overlay'))
+                        .some(el => el.offsetParent !== null ||
+                                    getComputedStyle(el).display !== 'none')"""
+            )
+        except Exception:
+            aberto = False
+        if not aberto:
+            return
+
+        # a) botoes de fechar / confirmar visiveis
+        for seletor in (
+            ".ui-dialog:visible .ui-dialog-titlebar-close",
+            ".ui-dialog:visible button:has-text('OK')",
+            ".ui-dialog:visible button:has-text('Fechar')",
+            ".ui-dialog:visible button:has-text('Continuar')",
+            ".ui-dialog:visible .ui-button",
+        ):
+            try:
+                alvo = rge.locator(seletor)
+                if alvo.count():
+                    alvo.first.click(timeout=2500)
+                    rge.wait_for_timeout(400)
+                    break
+            except Exception:
+                continue
+        else:
+            # b) ultimo recurso: esconder dialogo e overlay via JavaScript
+            try:
+                rge.evaluate(
+                    """() => {
+                        document.querySelectorAll('.ui-widget-overlay').forEach(el => el.remove());
+                        document.querySelectorAll('.ui-dialog').forEach(el => {
+                            if (getComputedStyle(el).display !== 'none') el.style.display = 'none';
+                        });
+                    }"""
+                )
+                rge.wait_for_timeout(300)
+            except Exception:
+                pass
+
         try:
             rge.keyboard.press("Escape")
-            rge.wait_for_timeout(300)
+            rge.wait_for_timeout(200)
         except Exception:
             pass
 
@@ -440,20 +483,13 @@ def pesquisar_lote(rge: Page, lote: str, data_inicio: str, data_fim: str,
         log.info("Filtros preenchidos: lote=%s, %s a %s", lote, data_inicio, data_fim)
 
         pausa_humana(rge)
-        rge.locator(f'[id="{ID_BTN_PESQUISAR}"]').click()
-        aguardar_ajax(rge)
-        aguardar_pagina_pronta(rge)
-        esperar_tabela_guias(rge)
+        executar_pesquisa(rge)
 
-        # Se voltou vazio, tenta de novo uma vez (pode ser ajax perdido) e,
-        # se insistir, informa o estado real dos filtros em vez de so falhar.
+        # Rede de seguranca: se ainda assim vier vazio, tenta mais uma vez.
         if contar_linhas_guias(rge) == 0:
             log.warning("Busca do lote %s voltou vazia; tentando novamente", lote)
-            rge.wait_for_timeout(1500)
-            rge.locator(f'[id="{ID_BTN_PESQUISAR}"]').click()
-            aguardar_ajax(rge)
-            aguardar_pagina_pronta(rge)
-            esperar_tabela_guias(rge)
+            rge.wait_for_timeout(1200)
+            executar_pesquisa(rge)
 
         if contar_linhas_guias(rge) == 0:
             estado = ler_estado_filtros(rge)
@@ -500,6 +536,46 @@ def contar_linhas_guias(rge: Page) -> int:
         return rge.locator(f'[id="{ID_TABELA_GUIAS}_data"] tr[data-ri]').count()
     except Exception:
         return 0
+
+
+def executar_pesquisa(rge: Page, timeout: int = 40000) -> bool:
+    """Clica em Pesquisar e espera o conteudo da tabela REALMENTE mudar.
+
+    Antes, a espera terminava assim que encontrava qualquer linha - inclusive a
+    mensagem "nenhum item" que sobrou da busca anterior. O robo lia zero
+    resultados e refazia a busca: toda pesquisa custava o dobro."""
+    try:
+        antes = rge.evaluate(
+            """(id) => {
+                const t = document.getElementById(id + '_data');
+                return t ? t.innerHTML.length : -1;
+            }""",
+            ID_TABELA_GUIAS,
+        )
+    except Exception:
+        antes = -1
+
+    rge.locator(f'[id="{ID_BTN_PESQUISAR}"]').click()
+
+    try:
+        rge.wait_for_function(
+            """([id, antes]) => {
+                const t = document.getElementById(id + '_data');
+                if (!t) return false;
+                const carregando = document.querySelectorAll('.blockUI.blockOverlay').length > 0;
+                return !carregando && t.innerHTML.length !== antes;
+            }""",
+            arg=[ID_TABELA_GUIAS, antes],
+            timeout=timeout,
+        )
+        mudou = True
+    except Exception:
+        # Pode ser que o resultado seja identico ao anterior - nao e erro
+        mudou = False
+
+    aguardar_ajax(rge)
+    aguardar_pagina_pronta(rge)
+    return mudou
 
 
 def esperar_tabela_guias(rge: Page, timeout: int = 30000):
@@ -747,13 +823,28 @@ def abrir_visualizar_protocolo(rge: Page, row_index: int, voltar: bool = True) -
 
     voltou = False
     if voltar:
-        try:
-            rge.go_back()
-            aguardar_ajax(rge)
-            aguardar_pagina_pronta(rge)
-            voltou = modal_de_recursos_visivel(rge)
-        except Exception as e:
-            log.info("Nao consegui voltar pelo historico: %s", e)
+        # go_back() nao funciona aqui: o JSF guarda estado no servidor e voltar
+        # pelo historico devolve uma pagina expirada. A propria tela tem um
+        # botao "Voltar", que o portal trata corretamente.
+        for seletor in (
+            'button:has-text("Voltar")',
+            'input[value="Voltar"]',
+            'a:has-text("Voltar")',
+        ):
+            try:
+                alvo = rge.locator(seletor)
+                if not alvo.count():
+                    continue
+                alvo.first.click(timeout=6000)
+                aguardar_ajax(rge)
+                aguardar_pagina_pronta(rge)
+                voltou = modal_de_recursos_visivel(rge)
+                if voltou:
+                    break
+            except Exception:
+                continue
+        if not voltou:
+            log.info("Retorno rapido indisponivel; a busca sera refeita")
 
     return {
         "data_uso": data_uso,
@@ -1042,8 +1133,13 @@ def processar_lote(req: ProcessarLoteRequest):
                     buscar()
                     guias = listar_guias(rge)
                 except Exception as e:
-                    # Lote sem nada nesta aba e normal, nao erro
-                    log.info("Aba %s, lote %s: sem resultados (%s)", aba, req.lote, e)
+                    # Falha na busca NAO e o mesmo que "aba sem resultados":
+                    # tratar as duas igual escondeu o Mat/Med inteiro parando.
+                    log.warning("Aba %s, lote %s: falha na busca (%s)", aba, req.lote, e)
+                    resultados.append(ItemExtraido(
+                        aba=aba, revisao_manual=True,
+                        erro=f"Busca falhou na aba {aba}: {e}",
+                    ))
                     continue
 
                 if not guias:
