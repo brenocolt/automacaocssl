@@ -62,6 +62,12 @@ IDS_DATA_REALIZACAO = (
 app = FastAPI(title="Bot Recurso de Glosa - SulAmérica")
 
 
+class SemResultados(Exception):
+    """O portal respondeu "Nenhum item disponivel" - a busca funcionou, o lote
+    e que nao tem nada nesta aba. Diferente de a busca ter quebrado."""
+
+
+
 class ProcessarLoteRequest(BaseModel):
     lote: str
     data_inicio_pagto: str   # dd/mm/aaaa
@@ -493,6 +499,12 @@ def pesquisar_lote(rge: Page, lote: str, data_inicio: str, data_fim: str,
 
         if contar_linhas_guias(rge) == 0:
             estado = ler_estado_filtros(rge)
+            # Filtros corretos + mensagem de vazio = lote sem nada nesta aba
+            if (str(estado.get("lote", "")).strip() == str(lote).strip()
+                    and "nenhum item" in str(estado.get("mensagem_tabela", "")).lower()):
+                raise SemResultados(
+                    f"Lote {lote} nao tem guias na aba {aba} (filtros conferidos)"
+                )
             caminho = capturar_screenshot_erro(rge, "busca_vazia")
             raise RuntimeError(
                 f"Busca do lote {lote} na aba {aba} nao retornou linhas. "
@@ -947,24 +959,44 @@ LIXO_RODAPE = re.compile(
     r"(Voltar|Visualizar Retorno|Copyright|SulAm[ée]rica\s*-\s*\d|Imprimir)", re.I
 )
 
+# Rotulos que aparecem DEPOIS da justificativa na linha expandida do item.
+# Sem cortar aqui, o texto capturado ia ate o fim do bloco e sobrava o "-" do
+# Grau Participacao no lugar da justificativa.
+ROTULO_SEGUINTE = re.compile(
+    r"^(valor|grau\s+participa|c[óo]d\.?\s|qtde|aceita\s+glosa|seq\.?\s*item)\b", re.I
+)
+ROTULO_JUSTIFICATIVA = re.compile(r"^(justificativa|observa[çc][ãa]o)\s*:?$", re.I)
+
 
 def _limpar_justificativa(texto: str) -> str:
-    """Tira o rotulo, o rodape do site e placeholders.
+    """Extrai so o texto da justificativa.
 
-    O texto chega de tres formas: varias linhas no Mat/Med, linha unica na aba
-    Itens, e as vezes so um traco - que e placeholder de "sem justificativa",
-    nao conteudo, e por isso vira string vazia."""
+    A linha expandida do item traz varios blocos empilhados:
+        Justificativa / <texto> / Valor / R$ X / Grau Participacao / -
+    Pegar a ultima linha devolvia o "-" do Grau Participacao. Agora lemos o que
+    vem DEPOIS do rotulo e paramos no proximo rotulo conhecido.
+    """
     if not texto:
         return ""
 
     linhas = [l.strip() for l in texto.splitlines() if l.strip()]
-    linhas = [l for l in linhas if l.lower() != "justificativa"]
-    # Descarta linhas que sao so rodape/navegacao antes de escolher o conteudo
-    linhas = [l for l in linhas if not LIXO_RODAPE.fullmatch(l.strip())
-              and not LIXO_RODAPE.match(l.strip())]
-    resultado = " ".join(linhas) if len(linhas) <= 1 else linhas[-1]
+    linhas = [l for l in linhas if not LIXO_RODAPE.match(l)]
+    if not linhas:
+        return ""
 
-    resultado = re.sub(r"^(justificativa|observa[çc][ãa]o)[:\s]*", "", resultado, flags=re.I)
+    idx = next((i for i, l in enumerate(linhas) if ROTULO_JUSTIFICATIVA.match(l)), None)
+
+    if idx is not None:
+        conteudo = []
+        for linha in linhas[idx + 1:]:
+            if ROTULO_SEGUINTE.match(linha) or ROTULO_JUSTIFICATIVA.match(linha):
+                break
+            conteudo.append(linha)
+        resultado = " ".join(conteudo)
+    else:
+        # Formato de linha unica: "Justificativa Solicito reanalise..."
+        resultado = " ".join(linhas)
+        resultado = re.sub(r"^(justificativa|observa[çc][ãa]o)[:\s]*", "", resultado, flags=re.I)
 
     corte = LIXO_RODAPE.search(resultado)
     if corte and corte.start() > 0:
@@ -987,6 +1019,10 @@ def _extrair_item(textos: List[str], justificativa_externa: str = "") -> Dict:
 
     Mat/Med: [.., '22', '0000273772 - TIRA...', '1705', 'R$ 3,95', '1', ..]
     Itens  : ['', '15', '60023120 - TAXA...', '', '1714', 'R$ 22,10', '1', '']
+
+    A celula vazia extra na aba Itens e a coluna "Grau Participacao", que nao
+    existe no Mat/Med - por isso a leitura por deslocamento fixo pegava a
+    coluna errada em todos os campos seguintes.
     """
     def so_digitos(t: str) -> bool:
         return bool(t) and t.replace(".", "").isdigit()
@@ -1132,9 +1168,13 @@ def processar_lote(req: ProcessarLoteRequest):
                 try:
                     buscar()
                     guias = listar_guias(rge)
+                except SemResultados as e:
+                    # Situacao normal: nem todo lote tem os dois tipos de recurso
+                    log.info("Aba %s, lote %s: %s", aba, req.lote, e)
+                    continue
                 except Exception as e:
-                    # Falha na busca NAO e o mesmo que "aba sem resultados":
-                    # tratar as duas igual escondeu o Mat/Med inteiro parando.
+                    # Falha de verdade precisa aparecer: foi tratar as duas
+                    # coisas como iguais que escondeu o Mat/Med inteiro parando.
                     log.warning("Aba %s, lote %s: falha na busca (%s)", aba, req.lote, e)
                     resultados.append(ItemExtraido(
                         aba=aba, revisao_manual=True,
