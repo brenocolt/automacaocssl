@@ -906,18 +906,16 @@ def _dados_do_protocolo(rge: Page) -> Dict:
     """Quando o recurso e feito para a guia inteira (Obj. do recurso = "Guia"),
     a tela nao tem tabela de itens: traz um bloco unico com a justificativa.
 
-    Le pelo DOM, nao por regex no texto da pagina: varrer innerText fazia a
-    justificativa vir com o rodape do site junto ("Voltar / Visualizar Retorno
-    / Copyright SulAmerica")."""
+    O rotulo aparece de duas formas: sozinho num elemento, com o texto num
+    irmao, OU junto do texto no mesmo elemento ("Justificativa: Solicito...").
+    Tratamos as duas - so a primeira era coberta antes, e por isso esses
+    protocolos vinham sem justificativa nenhuma."""
     try:
         return rge.evaluate(r"""() => {
             const limpar = (s) => (s || '')
-                .replace(/\s*\n\s*/g, ' ')
-                .replace(/\s{2,}/g, ' ')
-                .trim();
+                .replace(/\s+/g, ' ').trim();
 
-            // Lixo de rodape/navegacao que nunca faz parte da justificativa
-            const LIXO = /(Voltar|Visualizar Retorno|Copyright|SulAm[ée]rica\s*-\s*\d|Imprimir)/i;
+            const LIXO = /(Voltar|Visualizar Retorno|Copyright|SulAm[ée]rica\s*-\s*\d|Imprimir|Documentos Anexados)/i;
             const cortarLixo = (s) => {
                 let t = limpar(s);
                 const m = t.match(LIXO);
@@ -925,24 +923,38 @@ def _dados_do_protocolo(rge: Page) -> Dict:
                 return t.replace(/[\s.;,-]+$/, '').trim();
             };
 
-            // A justificativa fica na celula/bloco IRMAO do rotulo, nao no
-            // corpo inteiro da pagina.
-            let justificativa = '';
-            const rotulos = Array.from(
-                document.querySelectorAll('td, th, div, span, label, p')
-            ).filter(el => /^(Justificativa|Observa[çc][ãa]o)\s*:?$/i.test((el.innerText||'').trim()));
+            const ROTULO = /^(Justificativa|Observa[çc][ãa]o)\s*:?\s*/i;
+            const seletor = 'td, div, span, label, p';
 
-            for (const rot of rotulos) {
-                const candidatos = [
-                    rot.nextElementSibling,
-                    rot.parentElement ? rot.parentElement.nextElementSibling : null,
-                ];
-                for (const c of candidatos) {
-                    if (!c) continue;
-                    const txt = cortarLixo(c.innerText);
-                    if (txt && txt.length > 3) { justificativa = txt; break; }
+            let justificativa = '';
+            let menor = Infinity;
+
+            for (const el of document.querySelectorAll(seletor)) {
+                const texto = (el.innerText || '').trim();
+                if (!ROTULO.test(texto)) continue;
+
+                // a) rotulo e valor no MESMO elemento
+                const resto = texto.replace(ROTULO, '').trim();
+                if (resto.length > 3) {
+                    // o menor elemento que contem o par e o mais especifico:
+                    // evita capturar a pagina inteira junto
+                    if (texto.length < menor) {
+                        const limpo = cortarLixo(resto);
+                        if (limpo.length > 3) { justificativa = limpo; menor = texto.length; }
+                    }
+                    continue;
                 }
-                if (justificativa) break;
+
+                // b) rotulo sozinho, valor num elemento irmao
+                for (const c of [el.nextElementSibling,
+                                 el.parentElement ? el.parentElement.nextElementSibling : null]) {
+                    if (!c) continue;
+                    const limpo = cortarLixo(c.innerText);
+                    if (limpo.length > 3 && c.innerText.length < menor) {
+                        justificativa = limpo; menor = c.innerText.length;
+                        break;
+                    }
+                }
             }
 
             const acharValor = (re) => {
@@ -953,8 +965,8 @@ def _dados_do_protocolo(rge: Page) -> Dict:
             return {
                 justificativa,
                 valor_total: acharValor(/Valor Total Recursado:?\s*(R\$\s*[\d.,]+)/i),
-                objeto: acharValor(/Obj\. do recurso de glosa:?\s*\n*\s*([^\n]{1,40})/i),
-                num_guia_prestador: acharValor(/N[ºo°]\s*da guia no prestador:?\s*\n*\s*(\d+)/i),
+                objeto: acharValor(new RegExp('Obj\\. do recurso de glosa:?\\s*([^\\n]{1,40})', 'i')),
+                num_guia_prestador: acharValor(new RegExp('N[ºo°]\\s*da guia no prestador:?\\s*(\\d+)', 'i')),
             };
         }""")
     except Exception as e:
