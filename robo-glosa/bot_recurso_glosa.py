@@ -858,7 +858,10 @@ def abrir_visualizar_protocolo(rge: Page, row_index: int, voltar: bool = True) -
     except Exception as e:
         log.warning("Nao consegui ler a tabela de itens: %s", e)
 
-    protocolo_info = _dados_do_protocolo(rge) if not itens else {}
+    # Lido sempre: mesmo com itens, a justificativa deles pode vir vazia (o
+    # portal usa "-" como placeholder) e ai o texto util esta na "Observacao"
+    # do protocolo.
+    protocolo_info = _dados_do_protocolo(rge)
 
     voltou = False
     if voltar:
@@ -1146,12 +1149,17 @@ def consolidar_itens(itens: List[Dict], protocolo_info: Optional[Dict] = None) -
 
     justificativas = {it["justificativa"] for it in itens if it["justificativa"]}
     base = itens[0]
+
+    # Quando o item nao traz justificativa, cai para a "Observacao" do
+    # protocolo - e o mesmo texto que o colaborador copiava a mao.
+    justificativa = base["justificativa"] or (protocolo_info or {}).get("justificativa", "")
+
     resultado = {
         "descricao_item": base["descricao"],
         "codigo_item": base["codigo"],
         "cod_glosa": base["cod_glosa"],
         "qtde": base["qtde"],          # do 1o item, nao a soma (confirmado)
-        "justificativa": base["justificativa"],
+        "justificativa": justificativa,
         "revisao_manual": False,
     }
     if len(justificativas) > 1:
