@@ -41,7 +41,11 @@ PORTAL_CODIGO = os.environ["SULAMERICA_CODIGO"]
 PORTAL_USER = os.environ["SULAMERICA_USER"]
 PORTAL_PASS = os.environ["SULAMERICA_PASS"]
 HEADLESS = os.environ.get("HEADLESS", "true").lower() == "true"
-DELAY_MS = int(os.environ.get("DELAY_ENTRE_ACOES_MS", "400"))
+# Esperas fixas. Sao curtas, mas se repetem centenas de vezes por execucao -
+# baixar de 400 para 150 economiza minutos no total. Se o portal comecar a
+# falhar por leitura antecipada, suba os valores em vez de mexer no codigo.
+DELAY_MS = int(os.environ.get("DELAY_ENTRE_ACOES_MS", "150"))
+ESPERA_RENDER_MS = int(os.environ.get("ESPERA_RENDER_MS", "350"))
 # Imagens/fontes/rastreadores nao sao usados na extracao; bloquear acelera as
 # telas. Defina BLOQUEAR_MIDIA=false para depurar vendo o portal completo.
 BLOQUEAR_MIDIA = os.environ.get("BLOQUEAR_MIDIA", "true").lower() == "true"
@@ -126,7 +130,7 @@ def aguardar_pagina_pronta(page: Page, timeout: int = 20000):
         page.wait_for_load_state("domcontentloaded", timeout=timeout)
     except PWTimeout:
         pass
-    page.wait_for_timeout(800)
+    page.wait_for_timeout(ESPERA_RENDER_MS)
 
 
 def aguardar_ajax(page: Page, timeout: int = 25000):
@@ -139,7 +143,7 @@ def aguardar_ajax(page: Page, timeout: int = 25000):
         )
     except Exception:
         pass
-    page.wait_for_timeout(400)
+    page.wait_for_timeout(ESPERA_RENDER_MS)
 
 
 def capturar_screenshot_erro(page: Page, nome: str) -> str:
@@ -517,15 +521,26 @@ def pesquisar_lote(rge: Page, lote: str, data_inicio: str, data_fim: str,
         pausa_humana(rge)
         executar_pesquisa(rge)
 
-        # Rede de seguranca: se ainda assim vier vazio, tenta mais uma vez.
         if contar_linhas_guias(rge) == 0:
-            log.warning("Busca do lote %s voltou vazia; tentando novamente", lote)
-            rge.wait_for_timeout(1200)
+            estado = ler_estado_filtros(rge)
+            filtros_ok = str(estado.get("lote", "")).strip() == str(lote).strip()
+            portal_disse_vazio = "nenhum item" in str(estado.get("mensagem_tabela", "")).lower()
+
+            # Se os filtros estao certos e o portal ja respondeu "nenhum item",
+            # o lote realmente nao tem nada nesta aba. Refazer a busca so para
+            # confirmar custava ~30s por lote - e lotes sem Mat/Med sao comuns.
+            if filtros_ok and portal_disse_vazio:
+                raise SemResultados(
+                    f"Lote {lote} nao tem guias na aba {aba} (filtros conferidos)"
+                )
+
+            # Sem a mensagem de vazio, pode ter sido ajax perdido: vale repetir.
+            log.warning("Busca do lote %s sem resposta clara; tentando novamente", lote)
+            rge.wait_for_timeout(1000)
             executar_pesquisa(rge)
 
         if contar_linhas_guias(rge) == 0:
             estado = ler_estado_filtros(rge)
-            # Filtros corretos + mensagem de vazio = lote sem nada nesta aba
             if (str(estado.get("lote", "")).strip() == str(lote).strip()
                     and "nenhum item" in str(estado.get("mensagem_tabela", "")).lower()):
                 raise SemResultados(
@@ -634,6 +649,16 @@ def listar_guias(rge: Page) -> List[Dict]:
     """Tabela de resultados. As celulas tem classes nomeadas (grid-lote,
     grid-guia, grid-paciente...), confirmadas no HTML real - bem mais
     estaveis do que indices de coluna."""
+    # Hoje nenhum lote passa de 10 guias (confirmado pelo cliente), entao a
+    # tabela cabe numa pagina so. O aviso fica como rede de seguranca: se um
+    # dia isso mudar, aparece no log em vez de perder guias em silencio.
+    try:
+        paginas = rge.locator('.ui-paginator-page')
+        if paginas.count() > 1:
+            log.warning("Resultado tem %d paginas; apenas a atual sera lida", paginas.count())
+    except Exception:
+        pass
+
     linhas = rge.locator(f'[id="{ID_TABELA_GUIAS}_data"] tr[data-ri]')
     guias = []
     for i in range(linhas.count()):
