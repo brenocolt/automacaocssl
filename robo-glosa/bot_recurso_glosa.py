@@ -42,6 +42,9 @@ PORTAL_USER = os.environ["SULAMERICA_USER"]
 PORTAL_PASS = os.environ["SULAMERICA_PASS"]
 HEADLESS = os.environ.get("HEADLESS", "true").lower() == "true"
 DELAY_MS = int(os.environ.get("DELAY_ENTRE_ACOES_MS", "400"))
+# Imagens/fontes/rastreadores nao sao usados na extracao; bloquear acelera as
+# telas. Defina BLOQUEAR_MIDIA=false para depurar vendo o portal completo.
+BLOQUEAR_MIDIA = os.environ.get("BLOQUEAR_MIDIA", "true").lower() == "true"
 
 # IDs reais confirmados via playwright codegen
 ID_LOTE = '[id="formFiltros:loteConta:loteConta"]'
@@ -880,7 +883,7 @@ def abrir_visualizar_protocolo(rge: Page, row_index: int, voltar: bool = True) -
                 alvo.first.click(timeout=6000)
                 aguardar_ajax(rge)
                 aguardar_pagina_pronta(rge)
-                voltou = modal_de_recursos_visivel(rge)
+                voltou = busca_ainda_valida(rge)
                 if voltou:
                     break
             except Exception:
@@ -896,11 +899,17 @@ def abrir_visualizar_protocolo(rge: Page, row_index: int, voltar: bool = True) -
     }
 
 
-def modal_de_recursos_visivel(rge: Page) -> bool:
-    """Confirma que a tabela de protocolos continua na tela e utilizavel."""
+def busca_ainda_valida(rge: Page) -> bool:
+    """Depois de "Voltar", o portal devolve a TELA DE RESULTADOS - o modal
+    fecha, mas a busca continua valida.
+
+    Antes eu verificava se o modal estava aberto; como nunca estava, o robo
+    concluia que o retorno falhou e refazia a pesquisa inteira (30-50s) quando
+    bastava reabrir o modal da guia (3-5s). Era a causa de "0 retornos rapidos"
+    em todas as execucoes."""
     try:
-        tabela = rge.locator(f'[id="{ID_TABELA_RECURSOS}_data"] tr[data-ri]')
-        return tabela.count() > 0 and tabela.first.is_visible()
+        linhas = rge.locator(f'[id="{ID_TABELA_GUIAS}_data"] tr[data-ri]')
+        return linhas.count() > 0 and linhas.first.is_visible()
     except Exception:
         return False
 
@@ -1217,7 +1226,21 @@ def _processar(req: ProcessarLoteRequest, resultados: List[ItemExtraido],
                metricas: Dict) -> List[ItemExtraido]:
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=HEADLESS)
-        page = browser.new_context().new_page()
+        contexto = browser.new_context()
+
+        # Imagens, fontes e rastreadores nao servem para extrair dados e
+        # respondem por boa parte do tempo de carga de cada tela.
+        if BLOQUEAR_MIDIA:
+            contexto.route(
+                "**/*",
+                lambda rota: rota.abort()
+                if (rota.request.resource_type in ("image", "media", "font")
+                    or "datadoghq" in rota.request.url
+                    or "google-analytics" in rota.request.url)
+                else rota.continue_(),
+            )
+
+        page = contexto.new_page()
         inicio_exec = time.time()
         try:
             try:
@@ -1272,7 +1295,9 @@ def _processar(req: ProcessarLoteRequest, resultados: List[ItemExtraido],
                         protocolos = listar_protocolos(rge)
                         log.info("  guia %s: %d protocolo(s)", rotulo, len(protocolos))
 
-                        modal_valido = True
+                        # o modal ja esta aberto para o 1o protocolo
+                        primeiro = True
+                        busca_valida = False
                         for prot in protocolos:
                             if prot.get("row_index") is None:
                                 resultados.append(ItemExtraido(
@@ -1287,16 +1312,21 @@ def _processar(req: ProcessarLoteRequest, resultados: List[ItemExtraido],
                                 continue
 
                             try:
-                                # Refaz a busca apenas se o retorno rapido falhou
-                                if not modal_valido:
+                                # Caminho rapido: a busca sobreviveu ao "Voltar",
+                                # entao basta reabrir o modal da guia (3-5s) em
+                                # vez de refazer a pesquisa toda (30-50s).
+                                if primeiro:
+                                    primeiro = False          # modal ja aberto
+                                elif busca_valida:
+                                    abrir_detalhes_guia(rge, guia["row_index"])
+                                    metricas["retornos_rapidos"] += 1
+                                else:
                                     buscar()
                                     abrir_detalhes_guia(rge, guia["row_index"])
                                     metricas["retornos_lentos"] += 1
 
                                 detalhe = abrir_visualizar_protocolo(rge, prot["row_index"])
-                                modal_valido = detalhe.get("voltou", False)
-                                if modal_valido:
-                                    metricas["retornos_rapidos"] += 1
+                                busca_valida = detalhe.get("voltou", False)
 
                                 consolidado = consolidar_itens(
                                     detalhe["itens"], detalhe.get("protocolo_info")
@@ -1323,7 +1353,7 @@ def _processar(req: ProcessarLoteRequest, resultados: List[ItemExtraido],
                                     protocolo=prot.get("protocolo", ""),
                                     erro=str(e), revisao_manual=True,
                                 ))
-                                modal_valido = False
+                                busca_valida = False
                     except Exception as e:
                         log.exception("Falha na guia %s (aba %s)", rotulo, aba)
                         resultados.append(ItemExtraido(
