@@ -929,6 +929,22 @@ def _dados_do_protocolo(rge: Page) -> Dict:
             const ROTULO = /^(Justificativa|Observa[çc][ãa]o)\s*:?\s*/i;
             const seletor = 'td, div, span, label, p';
 
+            // Textos que sao ROTULO de outra coisa, nunca justificativa.
+            // Sem isso, o elemento seguinte a "Justificativa" na linha do item
+            // e o proximo cabecalho ("Valor", "Grau Participacao") e era ele
+            // que acabava gravado na planilha.
+            const NAO_E_JUSTIFICATIVA = new RegExp(
+                '^(valor|grau\\s+participa|documentos?\\s+anexad|itens?\\s+recursad|recurso|' +
+                'dados\\s+da\\s+guia|c[oó]d\\.?\\s|qtde|quantidade|aceita\\s+glosa|seq\\.?\\s|' +
+                'status|protocolo|data\\s|n[ºo°]\\s|justificativa|observa)', 'i');
+
+            // Uma justificativa real e uma frase: varias palavras e alguma letra.
+            const pareceFrase = (s) =>
+                s.length >= 12 &&
+                (s.match(/\s/g) || []).length >= 2 &&
+                /[A-Za-zÀ-ÿ]{3}/.test(s) &&
+                !NAO_E_JUSTIFICATIVA.test(s);
+
             let justificativa = '';
             let menor = Infinity;
 
@@ -943,7 +959,7 @@ def _dados_do_protocolo(rge: Page) -> Dict:
                     // evita capturar a pagina inteira junto
                     if (texto.length < menor) {
                         const limpo = cortarLixo(resto);
-                        if (limpo.length > 3) { justificativa = limpo; menor = texto.length; }
+                        if (pareceFrase(limpo)) { justificativa = limpo; menor = texto.length; }
                     }
                     continue;
                 }
@@ -953,7 +969,7 @@ def _dados_do_protocolo(rge: Page) -> Dict:
                                  el.parentElement ? el.parentElement.nextElementSibling : null]) {
                     if (!c) continue;
                     const limpo = cortarLixo(c.innerText);
-                    if (limpo.length > 3 && c.innerText.length < menor) {
+                    if (pareceFrase(limpo) && c.innerText.length < menor) {
                         justificativa = limpo; menor = c.innerText.length;
                         break;
                     }
