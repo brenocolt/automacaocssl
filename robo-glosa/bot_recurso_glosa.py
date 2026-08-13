@@ -60,6 +60,16 @@ ID_BTN_PESQUISAR = "formFiltros:btnPesquisar"
 ID_BTN_DETALHES = "formGrid:formButtons:modalDialogButton"
 MENU_POR_ABA = {"matmed": "formLink:menuMatMed", "itens": "formLink:menuItens"}
 ABAS = ("matmed", "itens")
+
+# O Mat/Med tem um seletor "Glosa Administrativa / Glosa Tecnica" que o robo
+# nunca tocava - ficava sempre no padrao (administrativa). Protocolos de glosa
+# tecnica existiam no portal e nunca eram encontrados. A aba Itens nao tem esse
+# seletor, entao ela e percorrida uma vez so.
+PASSAGENS = (
+    ("matmed", "administrativa"),
+    ("matmed", "tecnica"),
+    ("itens", None),
+)
 ID_TABELA_RECURSOS = "formGrid:formRecursos:gridTableRecursos"
 ID_TABELA_ITENS = "formRecursar:itensRecursoTable"
 IDS_DATA_REALIZACAO = (
@@ -89,6 +99,7 @@ class ProcessarLoteRequest(BaseModel):
 
 
 class ItemExtraido(BaseModel):
+    lote: str = ""
     aba: str = ""
     guia: str = ""
     protocolo: str = ""
@@ -489,6 +500,83 @@ def preencher_lote(rge: Page, lote: str):
     raise RuntimeError(f"Campo Lote ficou com '{atual}' em vez de '{lote}'")
 
 
+def selecionar_tipo_glosa(rge: Page, tipo: Optional[str]) -> None:
+    """Marca "Glosa Administrativa" ou "Glosa Tecnica" no topo da tela.
+
+    Precisa ser feito ANTES de preencher os filtros: trocar o radio dispara um
+    recarregamento do PrimeFaces que limpa lote e datas."""
+    if not tipo:
+        return
+
+    rotulo = "Glosa Técnica" if tipo == "tecnica" else "Glosa Administrativa"
+
+    def marcado() -> str:
+        try:
+            return rge.evaluate(
+                """() => {
+                    for (const inp of document.querySelectorAll('input[type=radio]')) {
+                        const marcado = inp.checked ||
+                            (inp.closest('.ui-radiobutton') || {}).querySelector?.('.ui-state-active');
+                        if (!marcado) continue;
+                        const caixa = inp.closest('td, div, span, label');
+                        const texto = (caixa && caixa.parentElement)
+                            ? caixa.parentElement.innerText : '';
+                        if (/t[ée]cnica/i.test(texto)) return 'tecnica';
+                        if (/administrativa/i.test(texto)) return 'administrativa';
+                    }
+                    return '';
+                }"""
+            )
+        except Exception:
+            return ""
+
+    for seletor in (
+        f'label:has-text("{rotulo}")',
+        f'td:has-text("{rotulo}") .ui-radiobutton-box',
+        f'span:has-text("{rotulo}")',
+    ):
+        try:
+            alvo = rge.locator(seletor)
+            if not alvo.count():
+                continue
+            alvo.first.click(timeout=5000)
+            aguardar_ajax(rge)
+            aguardar_pagina_pronta(rge)
+            log.info("Tipo de glosa: %s", rotulo)
+            return
+        except Exception:
+            continue
+
+    # Ultimo recurso: clicar no radio pelo texto vizinho, via JavaScript
+    try:
+        ok = rge.evaluate(
+            """(rotulo) => {
+                for (const inp of document.querySelectorAll('input[type=radio]')) {
+                    const bloco = inp.closest('td, div, span, label');
+                    const texto = (bloco && bloco.parentElement)
+                        ? bloco.parentElement.innerText : '';
+                    if (texto && texto.includes(rotulo)) {
+                        const caixa = (inp.closest('.ui-radiobutton') || {})
+                            .querySelector?.('.ui-radiobutton-box');
+                        (caixa || inp).click();
+                        return true;
+                    }
+                }
+                return false;
+            }""",
+            rotulo,
+        )
+        if ok:
+            aguardar_ajax(rge)
+            aguardar_pagina_pronta(rge)
+            log.info("Tipo de glosa: %s (via JavaScript)", rotulo)
+            return
+    except Exception:
+        pass
+
+    log.warning("Nao consegui selecionar '%s'; seguindo com o padrao da tela", rotulo)
+
+
 def desmarcar_somente_disponiveis(rge: Page):
     """Com esse filtro ligado, guias ja recursadas somem do resultado - e e
     justamente o historico que queremos. No Mat/Med vem desmarcado; na aba
@@ -503,9 +591,11 @@ def desmarcar_somente_disponiveis(rge: Page):
 
 
 def pesquisar_lote(rge: Page, lote: str, data_inicio: str, data_fim: str,
-                   aba: str = "matmed"):
+                   aba: str = "matmed", tipo_glosa: Optional[str] = None):
     try:
         garantir_tela_de_pesquisa(rge, aba)
+        # Antes dos filtros: trocar o radio recarrega o formulario
+        selecionar_tipo_glosa(rge, tipo_glosa)
         preencher_lote(rge, lote)
 
         # CRÍTICO: com esse checkbox marcado, guias já recursadas NÃO aparecem.
@@ -551,6 +641,11 @@ def pesquisar_lote(rge: Page, lote: str, data_inicio: str, data_fim: str,
                 f"Busca do lote {lote} na aba {aba} nao retornou linhas. "
                 f"Filtros como o portal recebeu: {estado}. Print: {caminho}"
             )
+    except SemResultados:
+        # "lote sem guias nesta aba" e situacao normal: precisa passar direto,
+        # senao vira RuntimeError e acaba gravado como linha de REVISAR no
+        # Google Sheets com a mensagem enganosa "Busca falhou".
+        raise
     except Exception as e:
         caminho = capturar_screenshot_erro(rge, "pesquisa")
         raise RuntimeError(f"Falha na pesquisa do lote {lote} ({e}). Print: {caminho}")
@@ -1274,44 +1369,49 @@ def _processar(req: ProcessarLoteRequest, resultados: List[ItemExtraido],
             except Exception as e:
                 raise HTTPException(status_code=502, detail=str(e))
 
-            for aba in ABAS:
+            vistos = set()   # protocolo ja capturado: evita repetir entre tipos
+
+            for aba, tipo_glosa in PASSAGENS:
+                rotulo_passagem = f"{aba}" + (f"/{tipo_glosa}" if tipo_glosa else "")
                 try:
                     ir_para_aba(rge, aba)
                 except Exception as e:
                     log.exception("Falha ao entrar na aba %s", aba)
                     resultados.append(ItemExtraido(
+                        lote=req.lote,
                         aba=aba, erro=f"Nao consegui abrir a aba {aba}: {e}",
                         revisao_manual=True,
                     ))
                     continue
 
-                def buscar(_aba=aba):
+                def buscar(_aba=aba, _tipo=tipo_glosa):
                     metricas["buscas"] += 1
                     pesquisar_lote(rge, req.lote, req.data_inicio_pagto,
-                                   req.data_fim_pagto, _aba)
+                                   req.data_fim_pagto, _aba, _tipo)
 
                 try:
                     buscar()
                     guias = listar_guias(rge)
                 except SemResultados as e:
-                    # Situacao normal: nem todo lote tem os dois tipos de recurso
-                    log.info("Aba %s, lote %s: %s", aba, req.lote, e)
+                    # Normal: nem todo lote tem recurso em toda combinacao
+                    log.info("%s, lote %s: %s", rotulo_passagem, req.lote, e)
                     continue
                 except Exception as e:
                     # Falha de verdade precisa aparecer: foi tratar as duas
                     # coisas como iguais que escondeu o Mat/Med inteiro parando.
-                    log.warning("Aba %s, lote %s: falha na busca (%s)", aba, req.lote, e)
+                    log.warning("%s, lote %s: falha na busca (%s)", rotulo_passagem, req.lote, e)
                     resultados.append(ItemExtraido(
+                        lote=req.lote,
                         aba=aba, revisao_manual=True,
                         erro=f"Busca falhou na aba {aba}: {e}",
                     ))
                     continue
 
                 if not guias:
-                    log.info("Aba %s, lote %s: nenhuma guia", aba, req.lote)
+                    log.info("%s, lote %s: nenhuma guia", rotulo_passagem, req.lote)
                     continue
 
-                log.info("Aba %s, lote %s: %d guia(s)", aba, req.lote, len(guias))
+                log.info("%s, lote %s: %d guia(s)", rotulo_passagem, req.lote, len(guias))
 
                 for guia in guias:
                     rotulo = guia.get("guia", "")
@@ -1324,8 +1424,17 @@ def _processar(req: ProcessarLoteRequest, resultados: List[ItemExtraido],
                         primeiro = True
                         busca_valida = False
                         for prot in protocolos:
+                            # Um protocolo pode aparecer na busca administrativa
+                            # e na tecnica; grava so na primeira vez.
+                            chave = str(prot.get("protocolo") or "").strip()
+                            if chave and chave in vistos:
+                                continue
+                            if chave:
+                                vistos.add(chave)
+
                             if prot.get("row_index") is None:
                                 resultados.append(ItemExtraido(
+                                    lote=req.lote,
                                     aba=aba, guia=rotulo, protocolo=prot["protocolo"],
                                     data_recurso=prot.get("data_recurso"),
                                     data_complemento=prot.get("data_complemento"),
@@ -1357,6 +1466,7 @@ def _processar(req: ProcessarLoteRequest, resultados: List[ItemExtraido],
                                     detalhe["itens"], detalhe.get("protocolo_info")
                                 )
                                 resultados.append(ItemExtraido(
+                                    lote=req.lote,
                                     aba=aba,
                                     guia=rotulo,
                                     protocolo=prot["protocolo"],
@@ -1374,6 +1484,7 @@ def _processar(req: ProcessarLoteRequest, resultados: List[ItemExtraido],
                                 log.exception("Falha no protocolo %s", prot.get("protocolo"))
                                 capturar_screenshot_erro(rge, f"prot_{prot.get('protocolo')}")
                                 resultados.append(ItemExtraido(
+                                    lote=req.lote,
                                     aba=aba, guia=rotulo,
                                     protocolo=prot.get("protocolo", ""),
                                     erro=str(e), revisao_manual=True,
@@ -1382,6 +1493,7 @@ def _processar(req: ProcessarLoteRequest, resultados: List[ItemExtraido],
                     except Exception as e:
                         log.exception("Falha na guia %s (aba %s)", rotulo, aba)
                         resultados.append(ItemExtraido(
+                            lote=req.lote,
                             aba=aba, guia=rotulo, erro=str(e), revisao_manual=True,
                         ))
         finally:
