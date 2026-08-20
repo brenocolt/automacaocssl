@@ -29,6 +29,11 @@ from playwright.sync_api import sync_playwright, Page, TimeoutError as PWTimeout
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("bot_recurso_glosa")
 
+# Carimbo de versao do codigo. Aparece no /health e no log de inicio para
+# eliminar a duvida recorrente de "qual versao esta rodando no Coolify?" -
+# tres rodadas de reprocessamento ja foram gastas sem essa certeza.
+VERSAO_BOT = "2026-08-20-fix9b-paginacao-modal"
+
 PORTAL_URL = os.environ.get(
     "SULAMERICA_PORTAL_URL",
     "https://saude.sulamericaseguros.com.br/prestador/login/",
@@ -78,6 +83,7 @@ IDS_DATA_REALIZACAO = (
 )
 
 app = FastAPI(title="Bot Recurso de Glosa - SulAmérica")
+log.info("bot_recurso_glosa iniciado - versao %s", VERSAO_BOT)
 
 # O n8n dispara varios lotes em paralelo e cada um abriria um Chromium.
 # Isso esgotava a memoria da VPS e fazia o portal recusar conexoes - dai a
@@ -1071,9 +1077,48 @@ def expandir_paginador_do_modal(rge: Page, id_tabela: str) -> None:
 
 def garantir_pagina_do_modal(rge: Page, pagina: int,
                              id_tabela: str = None) -> bool:
-    """Navega o paginador DO MODAL para a pagina pedida (1-based), clicando no
-    botao numerado. Devolve True se a pagina ativa terminou sendo a pedida."""
+    """Navega o paginador DO MODAL para a pagina pedida (1-based). Tenta o
+    botao numerado; se nao der, usa as setas proxima/anterior. Confirma com
+    espera ativa que a pagina ATIVA virou a pedida (o elemento _data existe
+    desde antes do clique, entao esperar so por ele nao garante nada)."""
     id_tabela = id_tabela or ID_TABELA_RECURSOS
+
+    def pagina_ativa_js() -> int:
+        try:
+            return rge.evaluate(
+                """(idTabela) => {
+                    const tbody = document.getElementById(idTabela + '_data');
+                    if (!tbody) return 1;
+                    const dt = tbody.closest('div.ui-datatable');
+                    if (!dt) return 1;
+                    const ativa = dt.querySelector('.ui-paginator .ui-paginator-page.ui-state-active');
+                    if (!ativa) return 1;
+                    const n = parseInt(ativa.textContent.trim(), 10);
+                    return isNaN(n) ? 1 : n;
+                }""",
+                id_tabela,
+            )
+        except Exception:
+            return 1
+
+    def esperar_pagina(alvo: int) -> bool:
+        try:
+            rge.wait_for_function(
+                """([idTabela, alvo]) => {
+                    const tbody = document.getElementById(idTabela + '_data');
+                    if (!tbody) return false;
+                    const dt = tbody.closest('div.ui-datatable');
+                    if (!dt) return false;
+                    const ativa = dt.querySelector('.ui-paginator .ui-paginator-page.ui-state-active');
+                    return !!ativa && parseInt(ativa.textContent.trim(), 10) === alvo;
+                }""",
+                arg=[id_tabela, alvo],
+                timeout=10000,
+            )
+            return True
+        except Exception:
+            return False
+
     try:
         container = _container_datatable(rge, id_tabela)
         if not container.count():
@@ -1082,16 +1127,10 @@ def garantir_pagina_do_modal(rge: Page, pagina: int,
         if not paginador.count():
             return pagina == 1
 
-        def pagina_ativa() -> int:
-            try:
-                ativa = paginador.locator(".ui-paginator-page.ui-state-active").first
-                return int(ativa.inner_text().strip()) if ativa.count() else 1
-            except Exception:
-                return 1
-
-        if pagina_ativa() == pagina:
+        if pagina_ativa_js() == pagina:
             return True
 
+        # 1a tentativa: botao numerado
         botoes = paginador.locator(".ui-paginator-page")
         alvo = None
         for i in range(botoes.count()):
@@ -1101,17 +1140,42 @@ def garantir_pagina_do_modal(rge: Page, pagina: int,
                     break
             except Exception:
                 continue
-        if alvo is None:
-            log.warning("Pagina %d nao encontrada no paginador do modal", pagina)
-            return False
+        if alvo is not None:
+            try:
+                alvo.click(timeout=6000)
+                aguardar_ajax(rge)
+                if esperar_pagina(pagina):
+                    return True
+                log.warning("Cliquei na pagina %d do modal mas a ativa e %d; "
+                            "tentando pelas setas", pagina, pagina_ativa_js())
+            except Exception as e:
+                log.warning("Clique no botao da pagina %d falhou (%s); "
+                            "tentando pelas setas", pagina, e)
 
-        alvo.click(timeout=6000)
-        aguardar_ajax(rge)
-        rge.locator(f'[id="{id_tabela}_data"]').wait_for(timeout=10000)
-        ok = pagina_ativa() == pagina
+        # 2a tentativa: setas proxima/anterior, um passo por vez
+        for _ in range(12):  # limite de seguranca
+            atual = pagina_ativa_js()
+            if atual == pagina:
+                return True
+            classe = ".ui-paginator-next" if pagina > atual else ".ui-paginator-prev"
+            seta = paginador.locator(classe).first
+            if not seta.count():
+                break
+            try:
+                if "ui-state-disabled" in (seta.get_attribute("class") or ""):
+                    break
+                seta.click(timeout=6000)
+                aguardar_ajax(rge)
+                esperado = atual + 1 if pagina > atual else atual - 1
+                esperar_pagina(esperado)
+            except Exception as e:
+                log.warning("Seta de paginacao do modal falhou: %s", e)
+                break
+
+        ok = pagina_ativa_js() == pagina
         if not ok:
-            log.warning("Cliquei na pagina %d do modal mas a ativa e %d",
-                        pagina, pagina_ativa())
+            log.warning("Nao consegui chegar na pagina %d do modal (ativa: %d)",
+                        pagina, pagina_ativa_js())
         return ok
     except Exception as e:
         log.warning("Falha ao navegar para a pagina %d do modal: %s", pagina, e)
@@ -2021,7 +2085,7 @@ def _processar(req: ProcessarLoteRequest, resultados: List[ItemExtraido],
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    return {"status": "ok", "versao": VERSAO_BOT}
 
 
 # ------------------------------------------------- preenchimento da planilha ----
