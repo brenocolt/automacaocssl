@@ -213,7 +213,9 @@ def preencher_data_primefaces(page: Page, base_id: str, valor: str):
     # 2) clicar, limpar e digitar como um humano
     try:
         campo.click(timeout=4000)
-        page.keyboard.press("Meta+A")
+        # ControlOrMeta: o robo roda em Linux (Ctrl), nao em macOS (Meta).
+        # Com "Meta+A" fixo esse fallback nunca limpava o campo em producao.
+        page.keyboard.press("ControlOrMeta+A")
         page.keyboard.press("Delete")
         page.keyboard.type(valor, delay=60)
         page.keyboard.press("Escape")
@@ -542,7 +544,23 @@ def selecionar_tipo_glosa(rge: Page, tipo: Optional[str]) -> None:
             alvo.first.click(timeout=5000)
             aguardar_ajax(rge)
             aguardar_pagina_pronta(rge)
-            log.info("Tipo de glosa: %s", rotulo)
+            # VERIFICA se o radio realmente mudou. O clique pode "funcionar"
+            # (sem excecao) e o PrimeFaces ignorar - e ai a passagem tecnica
+            # roda como administrativa: todos os protocolos ja estao em
+            # "vistos" e o resultado e zero novos, indistinguivel de "lote
+            # sem glosa tecnica". Foi a busca tecnica que recuperou 70% dos
+            # protocolos perdidos; falha silenciosa aqui nao pode existir.
+            atual = marcado()
+            if atual == tipo:
+                log.info("Tipo de glosa: %s (confirmado)", rotulo)
+                return
+            if atual:
+                log.warning("Cliquei em '%s' mas o radio ficou em '%s'; "
+                            "tentando outra estrategia", rotulo, atual)
+                continue
+            # estado ilegivel (layout mudou?): aceita o clique com aviso,
+            # comportamento antigo, para nao quebrar por falha de leitura
+            log.warning("Tipo de glosa: %s (clique feito, estado nao legivel)", rotulo)
             return
         except Exception:
             continue
@@ -569,25 +587,93 @@ def selecionar_tipo_glosa(rge: Page, tipo: Optional[str]) -> None:
         if ok:
             aguardar_ajax(rge)
             aguardar_pagina_pronta(rge)
-            log.info("Tipo de glosa: %s (via JavaScript)", rotulo)
-            return
+            atual = marcado()
+            if atual == tipo:
+                log.info("Tipo de glosa: %s (via JavaScript, confirmado)", rotulo)
+                return
+            if not atual:
+                log.warning("Tipo de glosa: %s (via JavaScript, estado nao legivel)", rotulo)
+                return
     except Exception:
         pass
 
-    log.warning("Nao consegui selecionar '%s'; seguindo com o padrao da tela", rotulo)
+    # Nenhuma estrategia confirmou o tipo pedido: abortar a passagem em vez
+    # de pesquisar com o filtro errado. O chamador (pesquisar_lote ->
+    # loop de passagens) converte isso em linha REVISAR na planilha.
+    caminho = capturar_screenshot_erro(rge, f"tipo_glosa_{tipo}")
+    raise RuntimeError(
+        f"Nao consegui selecionar '{rotulo}' (radio nao mudou). Print: {caminho}"
+    )
 
 
 def desmarcar_somente_disponiveis(rge: Page):
     """Com esse filtro ligado, guias ja recursadas somem do resultado - e e
     justamente o historico que queremos. No Mat/Med vem desmarcado; na aba
-    Itens vem MARCADO por padrao."""
+    Itens vem MARCADO por padrao.
+
+    A falha aqui NAO pode ser silenciosa: pesquisar com o filtro ligado
+    devolve so as guias ainda disponiveis para recurso, e todo o historico
+    (recursadas, expiradas) some sem nenhum vestigio na planilha."""
+
+    def estado():
+        """True/False = estado lido; None = nao consegui ler."""
+        try:
+            return rge.locator(f'[id="{ID_CHECKBOX_DISPONIVEIS}"]').is_checked(timeout=3000)
+        except Exception:
+            pass
+        try:
+            return rge.evaluate(
+                "(id) => { const el = document.getElementById(id); "
+                "return el ? el.checked : null; }",
+                ID_CHECKBOX_DISPONIVEIS,
+            )
+        except Exception:
+            return None
+
+    atual = estado()
+    if atual is None:
+        # Campo nao encontrado/ilegivel: pode ser mudanca de layout. Segue
+        # com aviso (comportamento antigo) - a checagem de resultado vazio
+        # em pesquisar_lote ainda protege contra a maior parte do estrago.
+        log.warning("Nao consegui ler o checkbox 'somente guias disponiveis'; seguindo")
+        return
+    if atual is False:
+        return  # ja esta como queremos
+
+    # 1) uncheck normal do Playwright
     try:
-        campo = rge.locator(f'[id="{ID_CHECKBOX_DISPONIVEIS}"]')
-        if campo.count() and campo.is_checked():
-            campo.uncheck(timeout=6000)
-            pausa_humana(rge)
+        rge.locator(f'[id="{ID_CHECKBOX_DISPONIVEIS}"]').uncheck(timeout=6000)
+        pausa_humana(rge)
     except Exception as e:
-        log.warning("Nao consegui desmarcar 'somente guias disponiveis': %s", e)
+        log.warning("uncheck() falhou (%s); tentando via JavaScript", e)
+    if estado() is False:
+        return
+
+    # 2) fallback: clicar via JavaScript (cobre o caso do input escondido
+    # atras do widget do PrimeFaces) e disparar o evento que o JSF escuta
+    try:
+        rge.evaluate(
+            """(id) => {
+                const el = document.getElementById(id);
+                if (!el) return;
+                const caixa = (el.closest('.ui-chkbox') || {})
+                    .querySelector?.('.ui-chkbox-box');
+                if (caixa) { caixa.click(); return; }
+                el.click();
+            }""",
+            ID_CHECKBOX_DISPONIVEIS,
+        )
+        aguardar_ajax(rge)
+    except Exception:
+        pass
+    if estado() is False:
+        return
+
+    caminho = capturar_screenshot_erro(rge, "checkbox_disponiveis")
+    raise RuntimeError(
+        "Checkbox 'somente guias disponiveis' continua MARCADO apos 2 "
+        f"tentativas - pesquisar assim esconderia o historico. Print: {caminho}"
+    )
 
 
 def pesquisar_lote(rge: Page, lote: str, data_inicio: str, data_fim: str,
@@ -740,19 +826,43 @@ def esperar_tabela_guias(rge: Page, timeout: int = 30000):
         log.warning("Tabela de guias nao renderizou dentro do tempo esperado")
 
 
+def paginas_de_resultado(rge: Page) -> int:
+    """Quantas paginas o resultado da pesquisa tem (1 = sem paginacao).
+    Le apenas o primeiro paginador: a tabela renderiza um no topo e outro no
+    rodape com os mesmos botoes, e contar os dois dobraria o numero."""
+    try:
+        pag = rge.locator(".ui-paginator").first
+        if not pag.count():
+            return 1
+        n = pag.locator(".ui-paginator-page").count()
+        return max(1, n)
+    except Exception:
+        return 1
+
+
 def listar_guias(rge: Page) -> List[Dict]:
     """Tabela de resultados. As celulas tem classes nomeadas (grid-lote,
     grid-guia, grid-paciente...), confirmadas no HTML real - bem mais
     estaveis do que indices de coluna."""
-    # Hoje nenhum lote passa de 10 guias (confirmado pelo cliente), entao a
-    # tabela cabe numa pagina so. O aviso fica como rede de seguranca: se um
-    # dia isso mudar, aparece no log em vez de perder guias em silencio.
+    # O padrao do portal e 10 guias por pagina, e ler so a pagina atual
+    # perderia as demais EM SILENCIO. Quando ha mais de uma pagina, sobe o
+    # paginador para 50 (o maior valor do dropdown) antes de ler. Se mesmo
+    # assim sobrar paginacao (>50 guias), o chamador detecta via
+    # paginas_de_resultado() e grava uma linha REVISAR na planilha.
     try:
-        paginas = rge.locator('.ui-paginator-page')
-        if paginas.count() > 1:
-            log.warning("Resultado tem %d paginas; apenas a atual sera lida", paginas.count())
-    except Exception:
-        pass
+        if paginas_de_resultado(rge) > 1:
+            dropdown = rge.locator("select.ui-paginator-rpp-options").first
+            if dropdown.count():
+                dropdown.select_option("50")
+                aguardar_ajax(rge)
+                esperar_tabela_guias(rge)
+                log.info("Resultado paginado: paginador ajustado para 50 por pagina")
+    except Exception as e:
+        log.warning("Nao consegui ajustar o paginador para 50: %s", e)
+
+    if paginas_de_resultado(rge) > 1:
+        log.warning("Resultado ainda tem %d paginas; apenas a atual sera lida",
+                    paginas_de_resultado(rge))
 
     linhas = rge.locator(f'[id="{ID_TABELA_GUIAS}_data"] tr[data-ri]')
     guias = []
@@ -778,12 +888,50 @@ def listar_guias(rge: Page) -> List[Dict]:
     return guias
 
 
-def abrir_detalhes_guia(rge: Page, row_index: int):
+def indice_da_guia(rge: Page, numero_guia: str) -> Optional[int]:
+    """Acha a posicao da linha cuja coluna 'Guia' bate com o numero dado.
+
+    O row_index e capturado na pesquisa original; se a busca for refeita e o
+    portal devolver as linhas em outra ordem, o indice antigo aponta para
+    outra guia - e os protocolos dela seriam gravados sob o rotulo errado.
+    Devolve None quando nao encontra (ou nao consegue ler)."""
+    alvo = str(numero_guia or "").strip()
+    if not alvo:
+        return None
+    try:
+        linhas = rge.locator(f'[id="{ID_TABELA_GUIAS}_data"] tr[data-ri]')
+        for i in range(linhas.count()):
+            try:
+                atual = linhas.nth(i).locator("td.grid-guia").first.inner_text().strip()
+            except Exception:
+                continue
+            if atual == alvo:
+                return i
+    except Exception:
+        pass
+    return None
+
+
+def abrir_detalhes_guia(rge: Page, row_index: int, numero_guia: str = ""):
     # O modal da guia anterior fica aberto e seu overlay intercepta o clique
     # na proxima linha. Era a causa das falhas em cascata: a primeira guia do
     # lote funcionava e todas as seguintes davam timeout de 30s.
     fechar_modal(rge)
     esperar_tabela_guias(rge)
+
+    # Se soubermos o numero da guia, confirmamos a posicao dela na tabela
+    # atual em vez de confiar no indice da busca anterior.
+    if numero_guia:
+        atual = indice_da_guia(rge, numero_guia)
+        if atual is None:
+            raise RuntimeError(
+                f"Guia {numero_guia} nao esta na tabela de resultados atual"
+            )
+        if atual != row_index:
+            log.warning("Guia %s mudou de posicao (%d -> %d) apos nova busca",
+                        numero_guia, row_index, atual)
+        row_index = atual
+
     linhas = rge.locator(f'[id="{ID_TABELA_GUIAS}_data"] tr[data-ri]')
     linha = linhas.nth(row_index)
     linha.wait_for(timeout=30000)
@@ -1411,13 +1559,70 @@ def _processar(req: ProcessarLoteRequest, resultados: List[ItemExtraido],
                     log.info("%s, lote %s: nenhuma guia", rotulo_passagem, req.lote)
                     continue
 
+                # Mesmo com o paginador em 50, sobrou mais de uma pagina
+                # (>50 guias no lote): as paginas seguintes nao serao lidas.
+                # Precisa virar linha na planilha - so log seria invisivel.
+                n_paginas = paginas_de_resultado(rge)
+                if n_paginas > 1:
+                    resultados.append(ItemExtraido(
+                        lote=req.lote,
+                        aba=aba,
+                        protocolo=f"PAGINACAO_{aba.upper()}",
+                        erro=(f"Resultado com {n_paginas} paginas na aba {aba}; "
+                              f"somente a primeira ({len(guias)} guias) foi lida - "
+                              "protocolos das demais paginas NAO capturados"),
+                        revisao_manual=True,
+                    ))
+
                 log.info("%s, lote %s: %d guia(s)", rotulo_passagem, req.lote, len(guias))
 
                 for guia in guias:
                     rotulo = guia.get("guia", "")
+
+                    # Abrir a guia e listar seus protocolos e o unico passo do
+                    # loop que, se falhar, perde TODOS os protocolos da guia
+                    # de uma vez - diferente da falha por protocolo (mais
+                    # abaixo), que ja tinha tratamento individual. Uma falha
+                    # aqui costuma ser transitoria (elemento ainda carregando
+                    # logo apos trocar de guia/tipo de glosa), entao vale
+                    # tentar de novo antes de desistir - mesmo padrao usado
+                    # em pesquisar_lote e abrir_rge.
+                    protocolos = None
+                    erro_abertura = None
+                    for tentativa in (1, 2):
+                        try:
+                            abrir_detalhes_guia(rge, guia["row_index"], rotulo)
+                            protocolos = listar_protocolos(rge)
+                            break
+                        except Exception as e:
+                            erro_abertura = e
+                            log.warning(
+                                "Falha ao abrir guia %s (aba %s), tentativa %d/2: %s",
+                                rotulo, aba, tentativa, e,
+                            )
+                            if tentativa == 1:
+                                pausa_humana(rge)
+
+                    if protocolos is None:
+                        # Sem lista de protocolos nao ha como saber quais
+                        # numeros ficaram de fora - mas o registro precisa
+                        # sobreviver ate a planilha. Sem campo "protocolo" o
+                        # /preencher-planilha descarta a linha em silencio
+                        # (contador "ignoradas"), entao o guia+lote+erro fica
+                        # so no log do servidor. Prefixar com o rotulo da
+                        # guia garante uma linha rastreavel na planilha,
+                        # mesmo sem o(s) numero(s) de protocolo.
+                        capturar_screenshot_erro(rge, f"guia_{rotulo}_{aba}")
+                        resultados.append(ItemExtraido(
+                            lote=req.lote,
+                            aba=aba, guia=rotulo,
+                            protocolo=f"GUIA_{rotulo}_SEM_ABRIR",
+                            erro=f"Nao consegui abrir a guia apos 2 tentativas: {erro_abertura}",
+                            revisao_manual=True,
+                        ))
+                        continue
+
                     try:
-                        abrir_detalhes_guia(rge, guia["row_index"])
-                        protocolos = listar_protocolos(rge)
                         log.info("  guia %s: %d protocolo(s)", rotulo, len(protocolos))
 
                         # o modal ja esta aberto para o 1o protocolo
@@ -1426,11 +1631,14 @@ def _processar(req: ProcessarLoteRequest, resultados: List[ItemExtraido],
                         for prot in protocolos:
                             # Um protocolo pode aparecer na busca administrativa
                             # e na tecnica; grava so na primeira vez.
+                            # O registro em "vistos" fica para DEPOIS de dar
+                            # certo: marcar antes fazia um protocolo que falhou
+                            # na passagem administrativa ser pulado na tecnica
+                            # e em Itens - jogando fora a segunda chance que as
+                            # 3 passagens dao de graca.
                             chave = str(prot.get("protocolo") or "").strip()
                             if chave and chave in vistos:
                                 continue
-                            if chave:
-                                vistos.add(chave)
 
                             if prot.get("row_index") is None:
                                 resultados.append(ItemExtraido(
@@ -1452,11 +1660,11 @@ def _processar(req: ProcessarLoteRequest, resultados: List[ItemExtraido],
                                 if primeiro:
                                     primeiro = False          # modal ja aberto
                                 elif busca_valida:
-                                    abrir_detalhes_guia(rge, guia["row_index"])
+                                    abrir_detalhes_guia(rge, guia["row_index"], rotulo)
                                     metricas["retornos_rapidos"] += 1
                                 else:
                                     buscar()
-                                    abrir_detalhes_guia(rge, guia["row_index"])
+                                    abrir_detalhes_guia(rge, guia["row_index"], rotulo)
                                     metricas["retornos_lentos"] += 1
 
                                 detalhe = abrir_visualizar_protocolo(rge, prot["row_index"])
@@ -1480,7 +1688,16 @@ def _processar(req: ProcessarLoteRequest, resultados: List[ItemExtraido],
                                     data_uso=detalhe["data_uso"],
                                     **consolidado,
                                 ))
+                                # Só agora o protocolo conta como capturado.
+                                if chave:
+                                    vistos.add(chave)
                             except Exception as e:
+                                # Nao entra em "vistos": se a falha foi
+                                # transitoria, a proxima passagem (tecnica ou
+                                # Itens) tenta o mesmo protocolo de novo. Se
+                                # falhar em todas, sobra a linha REVISAR - a
+                                # ultima sobrescreve a anterior na planilha,
+                                # entao nao gera duplicata.
                                 log.exception("Falha no protocolo %s", prot.get("protocolo"))
                                 capturar_screenshot_erro(rge, f"prot_{prot.get('protocolo')}")
                                 resultados.append(ItemExtraido(
@@ -1491,11 +1708,40 @@ def _processar(req: ProcessarLoteRequest, resultados: List[ItemExtraido],
                                 ))
                                 busca_valida = False
                     except Exception as e:
+                        # Falha inesperada em algum ponto do loop de
+                        # protocolos que nao foi pega pelo try/except por
+                        # protocolo acima (ex.: erro na propria iteracao).
+                        # Mesmo raciocinio do bloco de abertura da guia: sem
+                        # o campo "protocolo", a linha e descartada em
+                        # silencio pelo /preencher-planilha. Como aqui ja
+                        # temos a lista completa de "protocolos" da guia,
+                        # gravamos um REVISAR para cada um que ainda nao foi
+                        # registrado em "vistos" - os ja processados antes
+                        # da falha nao sao duplicados.
                         log.exception("Falha na guia %s (aba %s)", rotulo, aba)
-                        resultados.append(ItemExtraido(
-                            lote=req.lote,
-                            aba=aba, guia=rotulo, erro=str(e), revisao_manual=True,
-                        ))
+                        pendentes_da_guia = [
+                            p for p in (protocolos or [])
+                            if str(p.get("protocolo") or "").strip() not in vistos
+                        ]
+                        if pendentes_da_guia:
+                            for p in pendentes_da_guia:
+                                chave = str(p.get("protocolo") or "").strip()
+                                if chave:
+                                    vistos.add(chave)
+                                resultados.append(ItemExtraido(
+                                    lote=req.lote,
+                                    aba=aba, guia=rotulo,
+                                    protocolo=chave or f"GUIA_{rotulo}_FALHA_NO_LOOP",
+                                    erro=f"Falha na guia (protocolo nao processado): {e}",
+                                    revisao_manual=True,
+                                ))
+                        else:
+                            resultados.append(ItemExtraido(
+                                lote=req.lote,
+                                aba=aba, guia=rotulo,
+                                protocolo=f"GUIA_{rotulo}_FALHA_NO_LOOP",
+                                erro=str(e), revisao_manual=True,
+                            ))
         finally:
             browser.close()
 
