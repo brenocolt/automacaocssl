@@ -937,10 +937,113 @@ def abrir_detalhes_guia(rge: Page, row_index: int, numero_guia: str = ""):
     linha.wait_for(timeout=30000)
     linha.click()
     pausa_humana(rge)
+    # Captura o conteudo ANTES do clique para poder confirmar depois que a
+    # tabela realmente trocou - nao so que o elemento existe. O PrimeFaces
+    # reaproveita o mesmo modal entre aberturas (id igual), entao
+    # `.wait_for()` num elemento que ja existia antes retorna na hora, sem
+    # esperar o AJAX preencher o conteudo novo. Isso deixava a leitura
+    # vulneravel a pegar a tabela da guia/tipo ANTERIOR - mesma familia do
+    # bug que o executar_pesquisa ja resolve para a lista de guias (comparar
+    # innerHTML antes/depois), nunca replicada aqui. E o motivo mais provavel
+    # de protocolos que so existem sob um tipo de glosa especifico (ex.:
+    # Tecnica) sumirem quando a guia ja tinha sido aberta antes sob outro tipo.
+    try:
+        antes = rge.evaluate(
+            """(id) => {
+                const t = document.getElementById(id + '_data');
+                return t ? t.innerHTML.length : -1;
+            }""",
+            ID_TABELA_RECURSOS,
+        )
+    except Exception:
+        antes = -1
+
     rge.locator(f'[id="{ID_BTN_DETALHES}"]').click()
     aguardar_ajax(rge)
     rge.locator(f'[id="{ID_TABELA_RECURSOS}_data"]').wait_for(timeout=20000)
+
+    try:
+        rge.wait_for_function(
+            """([id, antes]) => {
+                const t = document.getElementById(id + '_data');
+                return t && t.innerHTML.length !== antes;
+            }""",
+            arg=[ID_TABELA_RECURSOS, antes],
+            timeout=8000,
+        )
+    except Exception:
+        # Pode ser coincidencia genuina (mesma quantidade de caracteres) ou
+        # atraso real do portal - registra para investigar sem travar o
+        # lote inteiro por causa disso.
+        log.warning(
+            "Tabela de protocolos nao mudou de conteudo apos abrir a guia "
+            "(guia=%s); pode estar lendo dado da abertura anterior",
+            numero_guia or row_index,
+        )
+
     pausa_humana(rge)
+
+
+def _container_datatable(rge: Page, id_tabela: str):
+    return rge.locator(f'[id="{id_tabela}_data"]').locator(
+        'xpath=ancestor::div[contains(@class,"ui-datatable")][1]'
+    )
+
+
+def paginas_do_modal(rge: Page, id_tabela: str) -> int:
+    """Quantas paginas a tabela DENTRO do modal atual tem (1 = sem paginacao
+    ou nao encontrada). Usa o mesmo container do id_tabela, nao o paginador
+    da lista de guias por tras do modal."""
+    try:
+        container = _container_datatable(rge, id_tabela)
+        if not container.count():
+            return 1
+        paginador = container.locator(".ui-paginator").first
+        if not paginador.count():
+            return 1
+        return max(1, paginador.locator(".ui-paginator-page").count())
+    except Exception:
+        return 1
+
+
+def expandir_paginador_do_modal(rge: Page, id_tabela: str) -> None:
+    """Sobe para 50 por pagina o paginador de DENTRO do modal 'Detalhes da
+    Guia' (a lista de protocolos de uma guia), se ele existir e tiver mais de
+    uma pagina.
+
+    Este e um paginador DIFERENTE do da lista de guias da pesquisa (esse ja e
+    tratado em listar_guias/paginas_de_resultado). Uma guia com mais
+    protocolos do que cabe numa pagina (10 por padrao) tinha o resto cortado
+    sem nenhum aviso: listar_protocolos so lia a pagina aberta na hora."""
+    try:
+        n_paginas = paginas_do_modal(rge, id_tabela)
+        if n_paginas <= 1:
+            return
+
+        container = _container_datatable(rge, id_tabela)
+        dropdown = container.locator("select.ui-paginator-rpp-options").first
+        if not dropdown.count():
+            log.warning(
+                "Modal de protocolos com %d paginas mas sem seletor de "
+                "linhas-por-pagina; protocolos das demais paginas em risco",
+                n_paginas,
+            )
+            return
+
+        dropdown.select_option("50")
+        aguardar_ajax(rge)
+        rge.locator(f'[id="{id_tabela}_data"]').wait_for(timeout=10000)
+
+        n_paginas_depois = paginas_do_modal(rge, id_tabela)
+        if n_paginas_depois > 1:
+            log.warning(
+                "Modal de protocolos ainda com %d paginas apos subir para "
+                "50/pagina; guia com mais de 50 protocolos", n_paginas_depois
+            )
+        else:
+            log.info("Modal de protocolos: paginador ajustado para 50 por pagina")
+    except Exception as e:
+        log.warning("Nao consegui ajustar o paginador do modal de protocolos: %s", e)
 
 
 def listar_protocolos(rge: Page) -> List[Dict]:
@@ -951,6 +1054,8 @@ def listar_protocolos(rge: Page) -> List[Dict]:
     As colunas sao localizadas pelo CABECALHO, nao por indice fixo: as duas
     abas tem layouts diferentes, e ler a coluna errada produzia valores altos
     demais e repetidos entre guias, sem nenhum erro aparente."""
+    expandir_paginador_do_modal(rge, ID_TABELA_RECURSOS)
+
     dados = rge.evaluate(
         r"""(idTabela) => {
             const tabela = document.getElementById(idTabela)
@@ -1593,6 +1698,22 @@ def _processar(req: ProcessarLoteRequest, resultados: List[ItemExtraido],
                         try:
                             abrir_detalhes_guia(rge, guia["row_index"], rotulo)
                             protocolos = listar_protocolos(rge)
+                            n_pag_modal = paginas_do_modal(rge, ID_TABELA_RECURSOS)
+                            if n_pag_modal > 1:
+                                # Guia com mais de 50 protocolos: mesmo apos
+                                # subir o paginador, ainda sobrou pagina.
+                                # Nao ha como saber quais protocolos ficaram
+                                # fora sem paginar manualmente - registra o
+                                # problema em vez de fingir que leu tudo.
+                                resultados.append(ItemExtraido(
+                                    lote=req.lote,
+                                    aba=aba, guia=rotulo,
+                                    protocolo=f"PAGINACAO_MODAL_{rotulo}",
+                                    erro=(f"Modal de protocolos da guia {rotulo} ainda com "
+                                          f"{n_pag_modal} paginas apos ajuste (>50 protocolos); "
+                                          f"somente a 1a pagina ({len(protocolos)} protocolos) foi lida"),
+                                    revisao_manual=True,
+                                ))
                             break
                         except Exception as e:
                             erro_abertura = e
@@ -1624,6 +1745,14 @@ def _processar(req: ProcessarLoteRequest, resultados: List[ItemExtraido],
 
                     try:
                         log.info("  guia %s: %d protocolo(s)", rotulo, len(protocolos))
+                        if protocolos and all(
+                            str(p.get("protocolo") or "").strip() in vistos for p in protocolos
+                        ):
+                            log.warning(
+                                "  guia %s (aba %s): TODOS os %d protocolos lidos ja estao em "
+                                "'vistos' - suspeita de tabela com conteudo da abertura anterior",
+                                rotulo, aba, len(protocolos),
+                            )
 
                         # o modal ja esta aberto para o 1o protocolo
                         primeiro = True
