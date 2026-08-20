@@ -32,7 +32,7 @@ log = logging.getLogger("bot_recurso_glosa")
 # Carimbo de versao do codigo. Aparece no /health e no log de inicio para
 # eliminar a duvida recorrente de "qual versao esta rodando no Coolify?" -
 # tres rodadas de reprocessamento ja foram gastas sem essa certeza.
-VERSAO_BOT = "2026-08-20-fix9b-paginacao-modal"
+VERSAO_BOT = "2026-08-20-fix9c-paginacao-modal-js"
 
 PORTAL_URL = os.environ.get(
     "SULAMERICA_PORTAL_URL",
@@ -1002,26 +1002,69 @@ def abrir_detalhes_guia(rge: Page, row_index: int, numero_guia: str = ""):
     pausa_humana(rge)
 
 
-def _container_datatable(rge: Page, id_tabela: str):
-    return rge.locator(f'[id="{id_tabela}_data"]').locator(
-        'xpath=ancestor::div[contains(@class,"ui-datatable")][1]'
-    )
-
-
 def paginas_do_modal(rge: Page, id_tabela: str) -> int:
     """Quantas paginas a tabela DENTRO do modal atual tem (1 = sem paginacao
-    ou nao encontrada). Usa o mesmo container do id_tabela, nao o paginador
-    da lista de guias por tras do modal."""
+    ou nao encontrada). Implementada em JavaScript puro, no mesmo estilo de
+    todo o codigo comprovadamente funcional deste robo - a versao anterior
+    usava localizadores do Playwright encadeados com XPath (ancestor::...),
+    que retornavam vazio em silencio neste portal e faziam TODO o tratamento
+    de paginacao ser pulado sem nenhum log."""
     try:
-        container = _container_datatable(rge, id_tabela)
-        if not container.count():
+        n = rge.evaluate(
+            """(idTabela) => {
+                // mesmo caminho primario do listar_protocolos, que sempre
+                // funcionou: o div externo tem id igual ao idTabela.
+                const dt = document.getElementById(idTabela)
+                        || document.getElementById(idTabela + '_data')?.closest('div.ui-datatable');
+                if (!dt) return -1;
+                const pag = dt.querySelector('.ui-paginator');
+                if (!pag) return 0;
+                return pag.querySelectorAll('.ui-paginator-page').length;
+            }""",
+            id_tabela,
+        )
+        if n is None or n < 0:
+            log.warning("paginas_do_modal: container da tabela %s nao encontrado", id_tabela)
             return 1
-        paginador = container.locator(".ui-paginator").first
-        if not paginador.count():
-            return 1
-        return max(1, paginador.locator(".ui-paginator-page").count())
-    except Exception:
+        return max(1, n)
+    except Exception as e:
+        log.warning("paginas_do_modal falhou: %s", e)
         return 1
+
+
+def _diag_estrutura_modal(rge: Page, id_tabela: str) -> None:
+    """Loga a estrutura real ao redor do tbody do modal - para descobrir, no
+    ambiente de verdade, onde esta o paginador quando a deteccao diz que nao
+    ha paginas mas o usuario as ve na tela."""
+    try:
+        diag = rge.evaluate(
+            """(idTabela) => {
+                const out = {
+                    idTabela: idTabela,
+                    divPrincipal: !!document.getElementById(idTabela),
+                    tbody: !!document.getElementById(idTabela + '_data'),
+                    ancestrais: [],
+                    paginadoresNaPagina: document.querySelectorAll('.ui-paginator').length,
+                };
+                const dt = document.getElementById(idTabela);
+                if (dt) {
+                    out.classeDiv = dt.className;
+                    out.paginadoresNoDiv = dt.querySelectorAll('.ui-paginator').length;
+                    out.botoesPaginaNoDiv = dt.querySelectorAll('.ui-paginator-page').length;
+                    out.htmlInicio = dt.innerHTML.slice(0, 600);
+                }
+                let el = document.getElementById(idTabela + '_data');
+                for (let i = 0; el && i < 6; i++) {
+                    out.ancestrais.push((el.tagName || '?') + '.' + (el.className || ''));
+                    el = el.parentElement;
+                }
+                return out;
+            }""",
+            id_tabela,
+        )
+        log.warning("DIAG estrutura do modal: %s", diag)
+    except Exception as e:
+        log.warning("DIAG estrutura do modal falhou: %s", e)
 
 
 def expandir_paginador_do_modal(rge: Page, id_tabela: str) -> None:
@@ -1045,9 +1088,8 @@ def expandir_paginador_do_modal(rge: Page, id_tabela: str) -> None:
 
         resultado = rge.evaluate(
             """(idTabela) => {
-                const tbody = document.getElementById(idTabela + '_data');
-                if (!tbody) return 'sem_tabela';
-                const dt = tbody.closest('div.ui-datatable');
+                const dt = document.getElementById(idTabela)
+                        || document.getElementById(idTabela + '_data')?.closest('div.ui-datatable');
                 if (!dt) return 'sem_datatable';
                 const sel = dt.querySelector('select.ui-paginator-rpp-options');
                 if (!sel) return 'sem_select';
@@ -1058,6 +1100,9 @@ def expandir_paginador_do_modal(rge: Page, id_tabela: str) -> None:
                 if (sel.value === alvo) return 'ja_estava';
                 sel.value = alvo;
                 sel.dispatchEvent(new Event('change', { bubbles: true }));
+                // PrimeFaces antigo registra o handler via jQuery e pode
+                // ignorar eventos nativos sintetizados - dispara pelos dois.
+                if (window.jQuery) { try { window.jQuery(sel).trigger('change'); } catch (e) {} }
                 return 'ok:' + alvo;
             }""",
             id_tabela,
@@ -1077,27 +1122,27 @@ def expandir_paginador_do_modal(rge: Page, id_tabela: str) -> None:
 
 def garantir_pagina_do_modal(rge: Page, pagina: int,
                              id_tabela: str = None) -> bool:
-    """Navega o paginador DO MODAL para a pagina pedida (1-based). Tenta o
-    botao numerado; se nao der, usa as setas proxima/anterior. Confirma com
-    espera ativa que a pagina ATIVA virou a pedida (o elemento _data existe
-    desde antes do clique, entao esperar so por ele nao garante nada)."""
+    """Navega o paginador DO MODAL para a pagina pedida (1-based). Tudo em
+    JavaScript puro (mesmo estilo do restante do robo): clique no botao
+    numerado e, se nao der, nas setas proxima/anterior. Confirma com espera
+    ativa que a pagina ATIVA virou a pedida."""
     id_tabela = id_tabela or ID_TABELA_RECURSOS
 
-    def pagina_ativa_js() -> int:
+    JS_ESTADO = """(idTabela) => {
+        const dt = document.getElementById(idTabela)
+                || document.getElementById(idTabela + '_data')?.closest('div.ui-datatable');
+        if (!dt) return null;
+        const pag = dt.querySelector('.ui-paginator');
+        if (!pag) return null;
+        const ativa = pag.querySelector('.ui-paginator-page.ui-state-active');
+        const n = ativa ? parseInt(ativa.textContent.trim(), 10) : 1;
+        return isNaN(n) ? 1 : n;
+    }"""
+
+    def pagina_ativa() -> int:
         try:
-            return rge.evaluate(
-                """(idTabela) => {
-                    const tbody = document.getElementById(idTabela + '_data');
-                    if (!tbody) return 1;
-                    const dt = tbody.closest('div.ui-datatable');
-                    if (!dt) return 1;
-                    const ativa = dt.querySelector('.ui-paginator .ui-paginator-page.ui-state-active');
-                    if (!ativa) return 1;
-                    const n = parseInt(ativa.textContent.trim(), 10);
-                    return isNaN(n) ? 1 : n;
-                }""",
-                id_tabela,
-            )
+            n = rge.evaluate(JS_ESTADO, id_tabela)
+            return n if isinstance(n, int) else 1
         except Exception:
             return 1
 
@@ -1105,9 +1150,8 @@ def garantir_pagina_do_modal(rge: Page, pagina: int,
         try:
             rge.wait_for_function(
                 """([idTabela, alvo]) => {
-                    const tbody = document.getElementById(idTabela + '_data');
-                    if (!tbody) return false;
-                    const dt = tbody.closest('div.ui-datatable');
+                    const dt = document.getElementById(idTabela)
+                            || document.getElementById(idTabela + '_data')?.closest('div.ui-datatable');
                     if (!dt) return false;
                     const ativa = dt.querySelector('.ui-paginator .ui-paginator-page.ui-state-active');
                     return !!ativa && parseInt(ativa.textContent.trim(), 10) === alvo;
@@ -1119,63 +1163,70 @@ def garantir_pagina_do_modal(rge: Page, pagina: int,
         except Exception:
             return False
 
-    try:
-        container = _container_datatable(rge, id_tabela)
-        if not container.count():
-            return pagina == 1
-        paginador = container.locator(".ui-paginator").first
-        if not paginador.count():
-            return pagina == 1
+    def clicar_js(tipo: str, valor: str = "") -> str:
+        """tipo: 'numero' (valor = numero da pagina) ou 'seta'
+        (valor = 'next'/'prev'). Retorna um codigo de resultado."""
+        try:
+            return rge.evaluate(
+                """([idTabela, tipo, valor]) => {
+                    const dt = document.getElementById(idTabela)
+                            || document.getElementById(idTabela + '_data')?.closest('div.ui-datatable');
+                    if (!dt) return 'sem_datatable';
+                    const pag = dt.querySelector('.ui-paginator');
+                    if (!pag) return 'sem_paginador';
+                    let alvo = null;
+                    if (tipo === 'numero') {
+                        alvo = Array.from(pag.querySelectorAll('.ui-paginator-page'))
+                            .find(b => b.textContent.trim() === valor) || null;
+                        if (!alvo) return 'botao_nao_encontrado';
+                    } else {
+                        alvo = pag.querySelector(valor === 'next' ? '.ui-paginator-next'
+                                                                  : '.ui-paginator-prev');
+                        if (!alvo) return 'seta_nao_encontrada';
+                        if (alvo.className.includes('ui-state-disabled')) return 'seta_desabilitada';
+                    }
+                    alvo.click();
+                    return 'clicado';
+                }""",
+                [id_tabela, tipo, valor],
+            )
+        except Exception as e:
+            log.warning("Clique JS no paginador do modal falhou: %s", e)
+            return "erro"
 
-        if pagina_ativa_js() == pagina:
+    try:
+        if pagina_ativa() == pagina:
             return True
 
         # 1a tentativa: botao numerado
-        botoes = paginador.locator(".ui-paginator-page")
-        alvo = None
-        for i in range(botoes.count()):
-            try:
-                if botoes.nth(i).inner_text().strip() == str(pagina):
-                    alvo = botoes.nth(i)
-                    break
-            except Exception:
-                continue
-        if alvo is not None:
-            try:
-                alvo.click(timeout=6000)
-                aguardar_ajax(rge)
-                if esperar_pagina(pagina):
-                    return True
-                log.warning("Cliquei na pagina %d do modal mas a ativa e %d; "
-                            "tentando pelas setas", pagina, pagina_ativa_js())
-            except Exception as e:
-                log.warning("Clique no botao da pagina %d falhou (%s); "
-                            "tentando pelas setas", pagina, e)
+        r = clicar_js("numero", str(pagina))
+        if r == "clicado":
+            aguardar_ajax(rge)
+            if esperar_pagina(pagina):
+                return True
+            log.warning("Cliquei na pagina %d do modal mas a ativa e %d; "
+                        "tentando pelas setas", pagina, pagina_ativa())
+        else:
+            log.warning("Botao da pagina %d do modal: %s; tentando pelas setas",
+                        pagina, r)
 
         # 2a tentativa: setas proxima/anterior, um passo por vez
         for _ in range(12):  # limite de seguranca
-            atual = pagina_ativa_js()
+            atual = pagina_ativa()
             if atual == pagina:
                 return True
-            classe = ".ui-paginator-next" if pagina > atual else ".ui-paginator-prev"
-            seta = paginador.locator(classe).first
-            if not seta.count():
+            r = clicar_js("seta", "next" if pagina > atual else "prev")
+            if r != "clicado":
+                log.warning("Seta de paginacao do modal: %s", r)
                 break
-            try:
-                if "ui-state-disabled" in (seta.get_attribute("class") or ""):
-                    break
-                seta.click(timeout=6000)
-                aguardar_ajax(rge)
-                esperado = atual + 1 if pagina > atual else atual - 1
-                esperar_pagina(esperado)
-            except Exception as e:
-                log.warning("Seta de paginacao do modal falhou: %s", e)
-                break
+            aguardar_ajax(rge)
+            esperado = atual + 1 if pagina > atual else atual - 1
+            esperar_pagina(esperado)
 
-        ok = pagina_ativa_js() == pagina
+        ok = pagina_ativa() == pagina
         if not ok:
             log.warning("Nao consegui chegar na pagina %d do modal (ativa: %d)",
-                        pagina, pagina_ativa_js())
+                        pagina, pagina_ativa())
         return ok
     except Exception as e:
         log.warning("Falha ao navegar para a pagina %d do modal: %s", pagina, e)
@@ -1259,6 +1310,7 @@ def listar_protocolos(rge: Page):
     cada uma. Devolve (lista_de_protocolos, paginas_que_falharam)."""
     expandir_paginador_do_modal(rge, ID_TABELA_RECURSOS)
     total_paginas = paginas_do_modal(rge, ID_TABELA_RECURSOS)
+    log.info("Modal da guia: %d pagina(s) detectada(s)", total_paginas)
 
     linhas_todas: List[Dict] = []
     cabecalhos = None
@@ -1277,6 +1329,11 @@ def listar_protocolos(rge: Page):
             paginas_falhas += 1
             log.warning("Pagina %d do modal sem tabela legivel", pagina)
             continue
+        if pagina == 1 and total_paginas == 1 and len(dados["linhas"]) >= 10:
+            # Tabela "cheia" (10+ linhas e uma pagina so detectada) e a
+            # assinatura classica de paginacao que o robo nao esta enxergando.
+            # Despeja a estrutura real no log para diagnostico.
+            _diag_estrutura_modal(rge, ID_TABELA_RECURSOS)
         if cabecalhos is None:
             cabecalhos, colunas = dados["cabecalhos"], dados["colunas"]
             faltando = [k for k, v in colunas.items() if v < 0]
