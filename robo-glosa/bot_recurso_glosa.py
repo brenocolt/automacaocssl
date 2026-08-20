@@ -851,12 +851,24 @@ def listar_guias(rge: Page) -> List[Dict]:
     # paginas_de_resultado() e grava uma linha REVISAR na planilha.
     try:
         if paginas_de_resultado(rge) > 1:
-            dropdown = rge.locator("select.ui-paginator-rpp-options").first
-            if dropdown.count():
-                dropdown.select_option("50")
+            resultado = rge.evaluate(
+                """() => {
+                    const sel = document.querySelector('select.ui-paginator-rpp-options');
+                    if (!sel) return 'sem_select';
+                    const opcoes = Array.from(sel.options).map(o => o.value);
+                    const alvo = opcoes.includes('50') ? '50' : opcoes[opcoes.length - 1];
+                    if (sel.value === alvo) return 'ja_estava';
+                    sel.value = alvo;
+                    sel.dispatchEvent(new Event('change', { bubbles: true }));
+                    return 'ok:' + alvo;
+                }"""
+            )
+            if str(resultado).startswith("ok"):
                 aguardar_ajax(rge)
                 esperar_tabela_guias(rge)
-                log.info("Resultado paginado: paginador ajustado para 50 por pagina")
+                log.info("Resultado paginado: paginador ajustado (%s)", resultado)
+            else:
+                log.warning("Resultado paginado; ajuste do paginador: %s", resultado)
     except Exception as e:
         log.warning("Nao consegui ajustar o paginador para 50: %s", e)
 
@@ -1012,51 +1024,104 @@ def expandir_paginador_do_modal(rge: Page, id_tabela: str) -> None:
     uma pagina.
 
     Este e um paginador DIFERENTE do da lista de guias da pesquisa (esse ja e
-    tratado em listar_guias/paginas_de_resultado). Uma guia com mais
-    protocolos do que cabe numa pagina (10 por padrao) tinha o resto cortado
-    sem nenhum aviso: listar_protocolos so lia a pagina aberta na hora."""
+    tratado em listar_guias/paginas_de_resultado).
+
+    IMPORTANTE: nao usa select_option() do Playwright. O PrimeFaces costuma
+    esconder o <select> nativo atras de um widget estilizado, e o Playwright
+    reprova acoes em elemento invisivel - a excecao caia no except, virava so
+    um warning no log, e o robo seguia lendo apenas a pagina 1. Setar o valor
+    e disparar o evento 'change' via JavaScript funciona com o select
+    escondido ou visivel."""
     try:
         n_paginas = paginas_do_modal(rge, id_tabela)
         if n_paginas <= 1:
             return
 
-        container = _container_datatable(rge, id_tabela)
-        dropdown = container.locator("select.ui-paginator-rpp-options").first
-        if not dropdown.count():
-            log.warning(
-                "Modal de protocolos com %d paginas mas sem seletor de "
-                "linhas-por-pagina; protocolos das demais paginas em risco",
-                n_paginas,
-            )
-            return
-
-        dropdown.select_option("50")
-        aguardar_ajax(rge)
-        rge.locator(f'[id="{id_tabela}_data"]').wait_for(timeout=10000)
-
-        n_paginas_depois = paginas_do_modal(rge, id_tabela)
-        if n_paginas_depois > 1:
-            log.warning(
-                "Modal de protocolos ainda com %d paginas apos subir para "
-                "50/pagina; guia com mais de 50 protocolos", n_paginas_depois
-            )
+        resultado = rge.evaluate(
+            """(idTabela) => {
+                const tbody = document.getElementById(idTabela + '_data');
+                if (!tbody) return 'sem_tabela';
+                const dt = tbody.closest('div.ui-datatable');
+                if (!dt) return 'sem_datatable';
+                const sel = dt.querySelector('select.ui-paginator-rpp-options');
+                if (!sel) return 'sem_select';
+                const opcoes = Array.from(sel.options).map(o => o.value);
+                // pega a maior opcao disponivel (normalmente 50)
+                const alvo = opcoes.includes('50') ? '50'
+                           : opcoes[opcoes.length - 1];
+                if (sel.value === alvo) return 'ja_estava';
+                sel.value = alvo;
+                sel.dispatchEvent(new Event('change', { bubbles: true }));
+                return 'ok:' + alvo;
+            }""",
+            id_tabela,
+        )
+        if str(resultado).startswith("ok"):
+            aguardar_ajax(rge)
+            rge.locator(f'[id="{id_tabela}_data"]').wait_for(timeout=10000)
+            n_depois = paginas_do_modal(rge, id_tabela)
+            log.info("Modal de protocolos: paginador ajustado (%s); paginas: %d -> %d",
+                     resultado, n_paginas, n_depois)
         else:
-            log.info("Modal de protocolos: paginador ajustado para 50 por pagina")
+            log.warning("Modal de protocolos com %d paginas; ajuste do paginador: %s",
+                        n_paginas, resultado)
     except Exception as e:
         log.warning("Nao consegui ajustar o paginador do modal de protocolos: %s", e)
 
 
-def listar_protocolos(rge: Page) -> List[Dict]:
-    """Modal 'Detalhes da Guia'. Cada protocolo aparece em duas linhas: envio
-    (link 'linkVisualizarRecurso') e retorno (link 'linkVisualizarRetorno').
-    Agrupamos as duas pelo numero do protocolo.
+def garantir_pagina_do_modal(rge: Page, pagina: int,
+                             id_tabela: str = None) -> bool:
+    """Navega o paginador DO MODAL para a pagina pedida (1-based), clicando no
+    botao numerado. Devolve True se a pagina ativa terminou sendo a pedida."""
+    id_tabela = id_tabela or ID_TABELA_RECURSOS
+    try:
+        container = _container_datatable(rge, id_tabela)
+        if not container.count():
+            return pagina == 1
+        paginador = container.locator(".ui-paginator").first
+        if not paginador.count():
+            return pagina == 1
 
-    As colunas sao localizadas pelo CABECALHO, nao por indice fixo: as duas
-    abas tem layouts diferentes, e ler a coluna errada produzia valores altos
-    demais e repetidos entre guias, sem nenhum erro aparente."""
-    expandir_paginador_do_modal(rge, ID_TABELA_RECURSOS)
+        def pagina_ativa() -> int:
+            try:
+                ativa = paginador.locator(".ui-paginator-page.ui-state-active").first
+                return int(ativa.inner_text().strip()) if ativa.count() else 1
+            except Exception:
+                return 1
 
-    dados = rge.evaluate(
+        if pagina_ativa() == pagina:
+            return True
+
+        botoes = paginador.locator(".ui-paginator-page")
+        alvo = None
+        for i in range(botoes.count()):
+            try:
+                if botoes.nth(i).inner_text().strip() == str(pagina):
+                    alvo = botoes.nth(i)
+                    break
+            except Exception:
+                continue
+        if alvo is None:
+            log.warning("Pagina %d nao encontrada no paginador do modal", pagina)
+            return False
+
+        alvo.click(timeout=6000)
+        aguardar_ajax(rge)
+        rge.locator(f'[id="{id_tabela}_data"]').wait_for(timeout=10000)
+        ok = pagina_ativa() == pagina
+        if not ok:
+            log.warning("Cliquei na pagina %d do modal mas a ativa e %d",
+                        pagina, pagina_ativa())
+        return ok
+    except Exception as e:
+        log.warning("Falha ao navegar para a pagina %d do modal: %s", pagina, e)
+        return False
+
+
+def _ler_linhas_modal(rge: Page):
+    """Le cabecalhos, mapa de colunas e linhas da pagina ATUAL da tabela de
+    protocolos do modal. Devolve None quando a tabela nao esta na tela."""
+    return rge.evaluate(
         r"""(idTabela) => {
             const tabela = document.getElementById(idTabela)
                         || document.getElementById(idTabela + '_data')?.closest('div.ui-datatable');
@@ -1115,19 +1180,55 @@ def listar_protocolos(rge: Page) -> List[Dict]:
         ID_TABELA_RECURSOS,
     )
 
-    if not dados:
-        log.warning("Tabela de recursos nao encontrada no modal")
-        return []
+def listar_protocolos(rge: Page):
+    """Modal 'Detalhes da Guia'. Cada protocolo aparece em duas linhas: envio
+    (link 'linkVisualizarRecurso') e retorno (link 'linkVisualizarRetorno').
+    Agrupamos as duas pelo numero do protocolo.
 
-    faltando = [k for k, v in dados["colunas"].items() if v < 0]
-    if faltando:
-        log.warning("Colunas nao localizadas pelo cabecalho: %s | cabecalhos: %s",
-                    faltando, dados["cabecalhos"])
+    As colunas sao localizadas pelo CABECALHO, nao por indice fixo: as duas
+    abas tem layouts diferentes, e ler a coluna errada produzia valores altos
+    demais e repetidos entre guias, sem nenhum erro aparente.
+
+    PAGINACAO: o modal pagina em 10 linhas (envio+retorno = 2 linhas por
+    protocolo, entao 15 protocolos = 3 paginas). Primeiro tenta subir o
+    paginador para 50; se ainda sobrar pagina, CAMINHA por todas elas lendo
+    cada uma. Devolve (lista_de_protocolos, paginas_que_falharam)."""
+    expandir_paginador_do_modal(rge, ID_TABELA_RECURSOS)
+    total_paginas = paginas_do_modal(rge, ID_TABELA_RECURSOS)
+
+    linhas_todas: List[Dict] = []
+    cabecalhos = None
+    colunas = None
+    paginas_falhas = 0
+
+    for pagina in range(1, total_paginas + 1):
+        if total_paginas > 1 and not garantir_pagina_do_modal(rge, pagina):
+            paginas_falhas += 1
+            continue
+        dados = _ler_linhas_modal(rge)
+        if not dados:
+            if pagina == 1 and total_paginas == 1:
+                log.warning("Tabela de recursos nao encontrada no modal")
+                return [], 0
+            paginas_falhas += 1
+            log.warning("Pagina %d do modal sem tabela legivel", pagina)
+            continue
+        if cabecalhos is None:
+            cabecalhos, colunas = dados["cabecalhos"], dados["colunas"]
+            faltando = [k for k, v in colunas.items() if v < 0]
+            if faltando:
+                log.warning("Colunas nao localizadas pelo cabecalho: %s | cabecalhos: %s",
+                            faltando, cabecalhos)
+        linhas_todas.extend(dados["linhas"])
+
+    if total_paginas > 1:
+        log.info("Modal com %d pagina(s): %d linha(s) coletadas, %d pagina(s) com falha",
+                 total_paginas, len(linhas_todas), paginas_falhas)
 
     protocolos: Dict[str, Dict] = {}
     ordem: List[str] = []
 
-    for linha in dados["linhas"]:
+    for linha in linhas_todas:
         protocolo = (linha.get("protocolo") or "").strip()
         if not protocolo:
             continue
@@ -1152,7 +1253,37 @@ def listar_protocolos(rge: Page) -> List[Dict]:
             if valor and not entry.get(chave_destino):
                 entry[chave_destino] = valor
 
-    return [protocolos[p] for p in ordem]
+    return [protocolos[p] for p in ordem], paginas_falhas
+
+
+def garantir_linha_visivel(rge: Page, row_index: int,
+                           id_tabela: str = None) -> bool:
+    """Garante que a linha do protocolo (link de envio) esteja renderizada
+    antes do clique. O data-ri e um indice ABSOLUTO no modelo de dados, mas o
+    link so existe no DOM quando a pagina do modal que contem aquela linha
+    esta exibida - e o paginador pode resetar para 10/pagina quando o modal e
+    reaberto. Se o link nao estiver na tela, tenta expandir o paginador e, se
+    preciso, caminha pelas paginas ate achar."""
+    id_tabela = id_tabela or ID_TABELA_RECURSOS
+    seletor = f'[id="{id_tabela}:{row_index}:linkVisualizarRecurso"]'
+    try:
+        if rge.locator(seletor).count():
+            return True
+        expandir_paginador_do_modal(rge, id_tabela)
+        if rge.locator(seletor).count():
+            return True
+        total = paginas_do_modal(rge, id_tabela)
+        for pagina in range(1, total + 1):
+            if not garantir_pagina_do_modal(rge, pagina, id_tabela):
+                continue
+            if rge.locator(seletor).count():
+                log.info("Linha do protocolo (row %d) encontrada na pagina %d do modal",
+                         row_index, pagina)
+                return True
+        return False
+    except Exception as e:
+        log.warning("Falha ao garantir visibilidade da linha %d: %s", row_index, e)
+        return False
 
 
 def abrir_visualizar_protocolo(rge: Page, row_index: int, voltar: bool = True) -> Dict:
@@ -1164,6 +1295,11 @@ def abrir_visualizar_protocolo(rge: Page, row_index: int, voltar: bool = True) -
     continuam validos e o proximo protocolo e so mais um clique.
     O chamador confere se deu certo (funcao voltou_para_modal) e refaz a busca
     apenas quando o retorno falha."""
+    if not garantir_linha_visivel(rge, row_index):
+        raise RuntimeError(
+            f"Linha do protocolo (row {row_index}) nao esta visivel em "
+            f"nenhuma pagina do modal - paginacao do modal falhou"
+        )
     rge.locator(f'[id="{ID_TABELA_RECURSOS}:{row_index}:linkVisualizarRecurso"]').click()
     aguardar_ajax(rge)
     aguardar_pagina_pronta(rge)
@@ -1693,25 +1829,25 @@ def _processar(req: ProcessarLoteRequest, resultados: List[ItemExtraido],
                     # tentar de novo antes de desistir - mesmo padrao usado
                     # em pesquisar_lote e abrir_rge.
                     protocolos = None
+                    paginas_falhas = 0
                     erro_abertura = None
                     for tentativa in (1, 2):
                         try:
                             abrir_detalhes_guia(rge, guia["row_index"], rotulo)
-                            protocolos = listar_protocolos(rge)
-                            n_pag_modal = paginas_do_modal(rge, ID_TABELA_RECURSOS)
-                            if n_pag_modal > 1:
-                                # Guia com mais de 50 protocolos: mesmo apos
-                                # subir o paginador, ainda sobrou pagina.
+                            protocolos, paginas_falhas = listar_protocolos(rge)
+                            if paginas_falhas > 0:
+                                # Alguma pagina do modal nao pode ser lida
+                                # mesmo apos expandir/navegar o paginador.
                                 # Nao ha como saber quais protocolos ficaram
-                                # fora sem paginar manualmente - registra o
-                                # problema em vez de fingir que leu tudo.
+                                # de fora - registra em vez de fingir que
+                                # leu tudo.
                                 resultados.append(ItemExtraido(
                                     lote=req.lote,
                                     aba=aba, guia=rotulo,
                                     protocolo=f"PAGINACAO_MODAL_{rotulo}",
-                                    erro=(f"Modal de protocolos da guia {rotulo} ainda com "
-                                          f"{n_pag_modal} paginas apos ajuste (>50 protocolos); "
-                                          f"somente a 1a pagina ({len(protocolos)} protocolos) foi lida"),
+                                    erro=(f"{paginas_falhas} pagina(s) do modal de protocolos "
+                                          f"da guia {rotulo} nao puderam ser lidas; "
+                                          f"{len(protocolos)} protocolos coletados nas demais"),
                                     revisao_manual=True,
                                 ))
                             break
