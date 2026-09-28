@@ -740,17 +740,44 @@ def esperar_tabela_guias(rge: Page, timeout: int = 30000):
         log.warning("Tabela de guias nao renderizou dentro do tempo esperado")
 
 
+def _ampliar_paginacao_guias(rge: Page) -> bool:
+    """So chamada quando ha mais de uma pagina de verdade (visto na base de
+    2019 - alguns lotes tem 2 paginas de guias, diferente da base de 2025
+    onde o cliente confirmou nunca passar de 10). Aumenta o seletor "linhas
+    por pagina" para o maior valor disponivel, em vez de navegar pagina a
+    pagina. Custa um ajax extra, mas so roda quando a paginacao existe."""
+    try:
+        seletores = rge.locator('select:visible')
+        for i in range(seletores.count()):
+            alvo = seletores.nth(i)
+            opcoes = alvo.locator("option")
+            valores = [opcoes.nth(k).get_attribute("value") for k in range(opcoes.count())]
+            numericos = [v for v in valores if v and v.isdigit()]
+            if not numericos:
+                continue
+            maior = max(numericos, key=int)
+            if alvo.input_value() == maior:
+                continue
+            alvo.select_option(maior)
+            aguardar_ajax(rge)
+            aguardar_pagina_pronta(rge)
+            esperar_tabela_guias(rge)
+            log.info("Paginacao de guias ampliada para %s linhas por pagina", maior)
+            return True
+    except Exception as e:
+        log.warning("Nao consegui ampliar a paginacao de guias: %s", e)
+    return False
+
+
 def listar_guias(rge: Page) -> List[Dict]:
     """Tabela de resultados. As celulas tem classes nomeadas (grid-lote,
     grid-guia, grid-paciente...), confirmadas no HTML real - bem mais
     estaveis do que indices de coluna."""
-    # Hoje nenhum lote passa de 10 guias (confirmado pelo cliente), entao a
-    # tabela cabe numa pagina so. O aviso fica como rede de seguranca: se um
-    # dia isso mudar, aparece no log em vez de perder guias em silencio.
     try:
         paginas = rge.locator('.ui-paginator-page')
         if paginas.count() > 1:
-            log.warning("Resultado tem %d paginas; apenas a atual sera lida", paginas.count())
+            log.warning("Resultado tem %d paginas; ampliando para ler tudo de uma vez", paginas.count())
+            _ampliar_paginacao_guias(rge)
     except Exception:
         pass
 
