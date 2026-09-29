@@ -1094,12 +1094,23 @@ def _dados_do_protocolo(rge: Page) -> Dict:
                 'dados\\s+da\\s+guia|c[oó]d\\.?\\s|qtde|quantidade|aceita\\s+glosa|seq\\.?\\s|' +
                 'status|protocolo|data\\s|n[ºo°]\\s|justificativa|observa)', 'i');
 
+            // Um cabecalho vizinho pode vir junto com hifen no meio
+            // ("- Valor - Grau Participação"), sem bater no NAO_E_JUSTIFICATIVA
+            // (ancorado no inicio da string) por causa do traco na frente. Se
+            // TODOS os pedaços separados por hifen forem rotulo conhecido (ou
+            // vazios), o texto inteiro e lixo, nao justificativa.
+            const soRotulos = (s) => {
+                const partes = s.split(/\s*-\s*/).map(p => p.trim()).filter(Boolean);
+                return partes.length > 0 && partes.every(p => NAO_E_JUSTIFICATIVA.test(p) || p.length <= 2);
+            };
+
             // Uma justificativa real e uma frase: varias palavras e alguma letra.
             const pareceFrase = (s) =>
                 s.length >= 12 &&
                 (s.match(/\s/g) || []).length >= 2 &&
                 /[A-Za-zÀ-ÿ]{3}/.test(s) &&
-                !NAO_E_JUSTIFICATIVA.test(s);
+                !NAO_E_JUSTIFICATIVA.test(s) &&
+                !soRotulos(s);
 
             let justificativa = '';
             let menor = Infinity;
