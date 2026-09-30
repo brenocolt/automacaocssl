@@ -298,6 +298,21 @@ def abrir_rge(page: Page) -> Page:
     return rge
 
 
+def reabrir_sessao(page: Page, rge: Page) -> Page:
+    """Quando o portal trava depois de abrir um protocolo (menus deixam de
+    responder), a unica saida confiavel e comecar de novo: fecha a janela do
+    RGE, refaz o login e reabre o sistema. Visto no lote 6390008465: depois do
+    1o protocolo o robo nao conseguiu mais entrar em nenhuma aba e as passagens
+    Mat/Med tecnica e Itens foram perdidas (R$ 50.689,00 na aba Itens)."""
+    try:
+        if rge is not page:
+            rge.close()
+    except Exception:
+        pass
+    fazer_login(page)
+    return abrir_rge(page)
+
+
 def ir_para_aba(rge: Page, aba: str):
     """As duas abas (Mat/Med e Itens) usam exatamente os mesmos IDs de campo e
     de tabela - confirmado inspecionando o HTML das duas. So muda o caminho de
@@ -1411,16 +1426,27 @@ def _processar(req: ProcessarLoteRequest, resultados: List[ItemExtraido],
 
             for aba, tipo_glosa in PASSAGENS:
                 rotulo_passagem = f"{aba}" + (f"/{tipo_glosa}" if tipo_glosa else "")
+                marcador = f"ERRO-{req.lote}-{rotulo_passagem.replace('/', '-').upper()}"
                 try:
                     ir_para_aba(rge, aba)
                 except Exception as e:
-                    log.exception("Falha ao entrar na aba %s", aba)
-                    resultados.append(ItemExtraido(
-                        lote=req.lote,
-                        aba=aba, erro=f"Nao consegui abrir a aba {aba}: {e}",
-                        revisao_manual=True,
-                    ))
-                    continue
+                    log.warning("Falha ao entrar na aba %s (%s); refazendo login e tentando de novo",
+                                aba, type(e).__name__)
+                    try:
+                        rge = reabrir_sessao(page, rge)
+                        metricas["sessoes_reabertas"] = metricas.get("sessoes_reabertas", 0) + 1
+                        ir_para_aba(rge, aba)
+                    except Exception as e2:
+                        log.exception("Falha ao entrar na aba %s mesmo apos novo login", aba)
+                        # Sem protocolo o registro seria descartado em silencio
+                        # pelo filtro "if not protocolo" do preenchimento; o
+                        # marcador faz a passagem perdida aparecer como REVISAR.
+                        resultados.append(ItemExtraido(
+                            lote=req.lote, protocolo=marcador,
+                            aba=aba, erro=f"Nao consegui abrir a aba {rotulo_passagem}: {e2}",
+                            revisao_manual=True,
+                        ))
+                        continue
 
                 def buscar(_aba=aba, _tipo=tipo_glosa):
                     metricas["buscas"] += 1
@@ -1437,13 +1463,25 @@ def _processar(req: ProcessarLoteRequest, resultados: List[ItemExtraido],
                 except Exception as e:
                     # Falha de verdade precisa aparecer: foi tratar as duas
                     # coisas como iguais que escondeu o Mat/Med inteiro parando.
-                    log.warning("%s, lote %s: falha na busca (%s)", rotulo_passagem, req.lote, e)
-                    resultados.append(ItemExtraido(
-                        lote=req.lote,
-                        aba=aba, revisao_manual=True,
-                        erro=f"Busca falhou na aba {aba}: {e}",
-                    ))
-                    continue
+                    log.warning("%s, lote %s: falha na busca (%s); refazendo login e tentando de novo",
+                                rotulo_passagem, req.lote, e)
+                    try:
+                        rge = reabrir_sessao(page, rge)
+                        metricas["sessoes_reabertas"] = metricas.get("sessoes_reabertas", 0) + 1
+                        ir_para_aba(rge, aba)
+                        buscar()
+                        guias = listar_guias(rge)
+                    except SemResultados as e2:
+                        log.info("%s, lote %s: %s", rotulo_passagem, req.lote, e2)
+                        continue
+                    except Exception as e2:
+                        log.warning("%s, lote %s: busca falhou de novo (%s)", rotulo_passagem, req.lote, e2)
+                        resultados.append(ItemExtraido(
+                            lote=req.lote, protocolo=marcador,
+                            aba=aba, revisao_manual=True,
+                            erro=f"Busca falhou na aba {rotulo_passagem}: {e2}",
+                        ))
+                        continue
 
                 if not guias:
                     log.info("%s, lote %s: nenhuma guia", rotulo_passagem, req.lote)
@@ -1530,9 +1568,17 @@ def _processar(req: ProcessarLoteRequest, resultados: List[ItemExtraido],
                                 busca_valida = False
                     except Exception as e:
                         log.exception("Falha na guia %s (aba %s)", rotulo, aba)
+                        # Sem protocolo, o endpoint de preenchimento descarta o
+                        # registro em silencio (filtro "if not protocolo").
+                        # Um marcador sintetico garante que a falha apareca na
+                        # planilha em vez de sumir sem deixar rastro - visto
+                        # com a guia 00024998 do lote 6390008540 (timeout ao
+                        # abrir a guia apos a anterior falhar na extracao).
                         resultados.append(ItemExtraido(
                             lote=req.lote,
-                            aba=aba, guia=rotulo, erro=str(e), revisao_manual=True,
+                            aba=aba, guia=rotulo,
+                            protocolo=f"ERRO-GUIA-{rotulo or 'desconhecida'}",
+                            erro=str(e), revisao_manual=True,
                         ))
         finally:
             browser.close()
